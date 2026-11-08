@@ -48,6 +48,23 @@ void user_set_active_window(H_HWND hwnd) {
     s_active_hwnd = hwnd;
 }
 
+
+
+static void get_window_screen_pos(win32_window_t *w, int *out_x, int *out_y) {
+    int sx = w->x;
+    int sy = w->y;
+    H_HWND cur_parent = w->parent;
+    while (cur_parent != 0) {
+        win32_window_t *pw = user_get_window(cur_parent);
+        if (!pw) break;
+        sx += pw->x;
+        sy += pw->y;
+        cur_parent = pw->parent;
+    }
+    *out_x = sx;
+    *out_y = sy;
+}
+
 bool user_post_message(H_HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     int next = (s_msg_tail + 1) % MSG_QUEUE_CAP;
     if (next == s_msg_head) {
@@ -59,7 +76,25 @@ bool user_post_message(H_HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     s_msg_queue[s_msg_tail].message = msg;
     s_msg_queue[s_msg_tail].wParam = wParam;
     s_msg_queue[s_msg_tail].lParam = lParam;
-    s_msg_queue[s_msg_tail].pt = s_cursor_pos;
+
+    /* In Win32, msg.pt is ALWAYS in screen coordinates.
+     * For mouse messages, if lParam carries client (x, y), convert to screen coordinates. */
+    if (msg >= WM_MOUSEMOVE && msg <= 0x020E && hwnd) {
+        win32_window_t *w = user_get_window(hwnd);
+        if (w) {
+            int sx = 0, sy = 0;
+            get_window_screen_pos(w, &sx, &sy);
+            int cl_x = (int16_t)(lParam & 0xFFFF);
+            int cl_y = (int16_t)((lParam >> 16) & 0xFFFF);
+            s_msg_queue[s_msg_tail].pt.x = sx + w->client_x + cl_x;
+            s_msg_queue[s_msg_tail].pt.y = sy + w->client_y + cl_y;
+            s_cursor_pos = s_msg_queue[s_msg_tail].pt;
+        } else {
+            s_msg_queue[s_msg_tail].pt = s_cursor_pos;
+        }
+    } else {
+        s_msg_queue[s_msg_tail].pt = s_cursor_pos;
+    }
     s_msg_tail = next;
     return true;
 }
@@ -828,20 +863,7 @@ static uint32_t u32_MessageBoxA(win32_process_t *proc, uint32_t *args) {
     return 1; /* IDOK */
 }
 
-static void get_window_screen_pos(win32_window_t *w, int *out_x, int *out_y) {
-    int sx = w->x;
-    int sy = w->y;
-    H_HWND cur_parent = w->parent;
-    while (cur_parent != 0) {
-        win32_window_t *pw = user_get_window(cur_parent);
-        if (!pw) break;
-        sx += pw->x;
-        sy += pw->y;
-        cur_parent = pw->parent;
-    }
-    *out_x = sx;
-    *out_y = sy;
-}
+
 
 /* Touch & Mouse Event Injection */
 void user_inject_mouse_down(int screen_x, int screen_y, bool right_button) {
@@ -1245,11 +1267,13 @@ static uint32_t u32_MoveWindow(win32_process_t *proc, uint32_t *args) {
     int y = (int)args[2];
     int w = (int)args[3];
     int h = (int)args[4];
+    BOOL bRepaint = (BOOL)args[5];
 
     win32_window_t *win = user_get_window(hwnd);
     if (win) {
         if (x > 0) win->x = x;
         if (y > 0) win->y = y;
+        bool resized = false;
         if (w > 0 && h > 0 && (w != win->width || h != win->height)) {
             win->width = w;
             win->height = h;
@@ -1258,6 +1282,11 @@ static uint32_t u32_MoveWindow(win32_process_t *proc, uint32_t *args) {
             win->framebuffer = allocate_window_framebuffer(w, h, 0xFFC0C0C0);
             update_window_client_area(win);
             paint_window_decorations(win);
+            resized = true;
+        }
+        if (resized || bRepaint) {
+            win->needs_redraw = true;
+            user_post_message(hwnd, WM_PAINT, 0, 0);
         }
         LOGI("MoveWindow: HWND 0x%08X to [%d,%d %dx%d]", hwnd, win->x, win->y, win->width, win->height);
         return 1;
@@ -1312,18 +1341,58 @@ static uint32_t u32_SetCapture(win32_process_t *proc, uint32_t *args) {
 }
 
 static uint32_t u32_MapWindowPoints(win32_process_t *proc, uint32_t *args) {
-    (void)proc; (void)args;
-    return 0;
+    H_HWND hWndFrom = (H_HWND)args[0];
+    H_HWND hWndTo   = (H_HWND)args[1];
+    uint32_t lpPoints = args[2];
+    uint32_t cPoints  = args[3];
+
+    if (!lpPoints || cPoints == 0) return 0;
+
+    int from_sx = 0, from_sy = 0;
+    if (hWndFrom) {
+        win32_window_t *wFrom = user_get_window(hWndFrom);
+        if (wFrom) {
+            get_window_screen_pos(wFrom, &from_sx, &from_sy);
+            from_sx += wFrom->client_x;
+            from_sy += wFrom->client_y;
+        }
+    }
+
+    int to_sx = 0, to_sy = 0;
+    if (hWndTo) {
+        win32_window_t *wTo = user_get_window(hWndTo);
+        if (wTo) {
+            get_window_screen_pos(wTo, &to_sx, &to_sy);
+            to_sx += wTo->client_x;
+            to_sy += wTo->client_y;
+        }
+    }
+
+    int dx = from_sx - to_sx;
+    int dy = from_sy - to_sy;
+
+    for (uint32_t i = 0; i < cPoints; i++) {
+        WIN_POINT pt;
+        if (guest_mem_read(&proc->mem, lpPoints + i * sizeof(WIN_POINT), &pt, sizeof(pt))) {
+            pt.x += dx;
+            pt.y += dy;
+            guest_mem_write(&proc->mem, lpPoints + i * sizeof(WIN_POINT), &pt, sizeof(pt));
+        }
+    }
+
+    return (uint32_t)((dy << 16) | (dx & 0xFFFF));
 }
 
 static uint32_t u32_PtInRect(win32_process_t *proc, uint32_t *args) {
     uint32_t lprc_va = args[0];
     int x = (int)args[1];
     int y = (int)args[2];
-    WIN_RECT rc;
+    WIN_RECT rc = {0};
     if (!guest_mem_read(&proc->mem, lprc_va, &rc, sizeof(rc))) return 0;
-    if (x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom) return 1;
-    return 0;
+    bool inside = (x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom);
+    LOGI("PtInRect: lprc=0x%08X rc=[%d,%d,%d,%d] pt=(%d,%d) -> %s",
+         lprc_va, rc.left, rc.top, rc.right, rc.bottom, x, y, inside ? "TRUE" : "FALSE");
+    return inside ? 1 : 0;
 }
 
 static uint32_t u32_SetRect(win32_process_t *proc, uint32_t *args) {
@@ -1620,6 +1689,8 @@ static uint32_t u32_SetWindowPos(win32_process_t *proc, uint32_t *args) {
                 w->framebuffer = allocate_window_framebuffer(cx, cy, 0xFFC0C0C0);
                 update_window_client_area(w);
                 paint_window_decorations(w);
+                w->needs_redraw = true;
+                user_post_message(hwnd, WM_PAINT, 0, 0);
             }
         }
         if (flags & 0x0040) w->visible = true;
