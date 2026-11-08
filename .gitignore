@@ -30,5 +30,11 @@ build/
 *.tar.xz
 *.7z
 
+# Win32HLE build artifacts
+win32hle/win32hle
+win32hle/win32hle.exe
+win32hle/win32hle-arm64
+win32hle/src/*.d
+
 # Large disk images (win95.img is >125MB, exceeding GitHub's 100MB file limit)
 *.img

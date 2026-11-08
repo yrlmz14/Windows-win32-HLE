@@ -1,0 +1,4 @@
+*.o
+*.d
+win32hle
+win32hle-arm64

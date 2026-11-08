@@ -31,6 +31,14 @@ This repository contains two complementary execution engines tailored specifical
      - Notepad (`notepad.exe`)
      - Paint (`paint.exe`)
 
+3. **Modern Windows 7 & Windows 10 Win32 HLE Runtime (`win32hle/`)**:
+   - Next-generation Win32 HLE designed specifically for modern binaries (MSVC 2015–2022, modern MinGW, Clang).
+   - **ApiSet Schema Redirection**: Translates modular `api-ms-win-*`, `ext-ms-*`, and `kernelbase.dll` imports.
+   - **Modern Synchronization**: SRW Locks, Condition Variables, InitOnce, and Futexes (`WaitOnAddress` / `WakeByAddress`).
+   - **Low-Memory 512 MB RAM Ceiling**: Tracks physical page commits with `--ram-limit <MB>` and immediately releases memory via `madvise(..., MADV_DONTNEED)`.
+   - **Dual-Engine CPU**: Fast ARM64 JIT Dynarec with `UXTW` zero-overhead addressing + portable x86 interpreter.
+   - **`KUSER_SHARED_DATA` at `0x7FFE0000`**: Reports Windows 7 / 10 build versions, processor features, and high-precision time.
+
 ---
 
 ## Directory Structure
@@ -57,6 +65,10 @@ This repository contains two complementary execution engines tailored specifical
 │   ├── x86_core.c / .h          # 32-bit x86 CPU emulator core
 │   ├── platform/                # Kindle hardware drivers (fb0, touch, virtual keyboard)
 │   └── win32/                   # Win32 subsystem DLL implementations
+├── win32hle/                    # Windows 7 & 10 HLE Runtime (ARM64 Dynarec + 512MB RAM constraint)
+│   ├── include/                 # Header interfaces (apiset, dynarec, sync, teb_peb, memory)
+│   ├── src/                     # Implementation (kernel32_win7_10, ucrt, sync, arm64_dynarec)
+│   └── tests/                   # Verification test suite (Win7, Win10, ApiSet, MemLimit, Extended)
 ├── patch_win95_img.py           # Helper script to tune WIN.INI mouse sensitivity in win95.img
 └── Makefile                     # Build system for host simulation and Kindle ARM binaries
 ```
@@ -133,6 +145,12 @@ extensions/win32/win95.img
 ```bash
 # Build desktop host simulator
 make
+
+# Build Windows 7 & 10 HLE CLI engine
+make win32hle
+
+# Run Windows 7 & 10 test suites
+make test_win710
 
 # Build Kindle ARMv7 native binary
 make kindle

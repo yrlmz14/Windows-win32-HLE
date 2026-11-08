@@ -1,0 +1,4 @@
+LIBRARY BCRYPT.DLL
+EXPORTS
+  BCryptGenRandom@16
+  ProcessPrng@8

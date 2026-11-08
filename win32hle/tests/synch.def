@@ -1,0 +1,6 @@
+LIBRARY api-ms-win-core-synch-l1-1-0.dll
+EXPORTS
+  AcquireSRWLockExclusive@4
+  ReleaseSRWLockExclusive@4
+  WaitOnAddress@16
+  WakeByAddressSingle@4
