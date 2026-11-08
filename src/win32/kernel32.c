@@ -302,6 +302,28 @@ static uint32_t k32_GetCommandLineA(win32_process_t *proc, uint32_t *args) {
     return proc->image_base; /* Pointer to command line string */
 }
 
+static uint32_t k32_GetCommandLineW(win32_process_t *proc, uint32_t *args) {
+    (void)args;
+    static const uint16_t cmdline[] = {'a','p','p','.','e','x','e',0};
+    static uint32_t guest_cmdline_va = 0;
+    if (!guest_cmdline_va) {
+        guest_cmdline_va = 0x02800000;
+        guest_mem_commit(&proc->mem, guest_cmdline_va, 0x1000);
+        guest_mem_write(&proc->mem, guest_cmdline_va, cmdline, sizeof(cmdline));
+    }
+    return guest_cmdline_va;
+}
+
+static uint32_t k32_MulDiv(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    int32_t nNumber = (int32_t)args[0];
+    int32_t nNumerator = (int32_t)args[1];
+    int32_t nDenominator = (int32_t)args[2];
+    if (nDenominator == 0) return (uint32_t)-1;
+    int64_t res = ((int64_t)nNumber * (int64_t)nNumerator) / (int64_t)nDenominator;
+    return (uint32_t)(int32_t)res;
+}
+
 static uint32_t k32_GetVersionExA(win32_process_t *proc, uint32_t *args) {
     uint8_t *info = guest_va_to_host(&proc->mem, args[0]);
     if (!info) return 0;
@@ -793,6 +815,8 @@ void kernel32_init(void) {
     win32_register_api("KERNEL32.DLL", "GetModuleHandleA", 0, k32_GetModuleHandleA, 1);
     win32_register_api("KERNEL32.DLL", "GetStartupInfoA", 0, k32_GetStartupInfoA, 1);
     win32_register_api("KERNEL32.DLL", "GetCommandLineA", 0, k32_GetCommandLineA, 0);
+    win32_register_api("KERNEL32.DLL", "GetCommandLineW", 0, k32_GetCommandLineW, 0);
+    win32_register_api("KERNEL32.DLL", "MulDiv", 0, k32_MulDiv, 3);
     win32_register_api("KERNEL32.DLL", "GetVersionExA", 0, k32_GetVersionExA, 1);
     win32_register_api("KERNEL32.DLL", "GetModuleFileNameA", 0, k32_GetModuleFileNameA, 3);
     win32_register_api("KERNEL32.DLL", "GetPrivateProfileIntW", 0, k32_GetPrivateProfileIntW, 4);

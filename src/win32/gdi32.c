@@ -395,7 +395,7 @@ static uint32_t gdi_BitBlt(win32_process_t *proc, uint32_t *args) {
             if (dx < 0 || dx >= bm_dst->bitmap.width) continue;
 
             uint32_t pixel = *(uint32_t *)(bm_src->bitmap.bits + (sy * bm_src->bitmap.stride) + (sx * 4));
-            *(uint32_t *)(bm_dst->bitmap.bits + (dy * bm_dst->bitmap.stride) + (dx * 4)) = pixel;
+            *(uint32_t *)(bm_dst->bitmap.bits + (dy * bm_dst->bitmap.stride) + (dx * 4)) = pixel | 0xFF000000;
         }
     }
     return 1;
@@ -410,17 +410,21 @@ static uint32_t gdi_PatBlt(win32_process_t *proc, uint32_t *args) {
     int h = (int)args[4];
     uint32_t rop = args[5];
 
+    if (w < 0) { x += w; w = -w; }
+    if (h < 0) { y += h; h = -h; }
+    if (w <= 0 || h <= 0) return 1;
+
     gdi_dc_t *dc = gdi_get_dc(hdc);
     if (!dc) return 0;
     gdi_object_t *bm = gdi_get_obj((H_HANDLE)dc->selected_bitmap);
     if (!bm || !bm->bitmap.bits) return 0;
 
-    uint32_t fill_color = 0x00FFFFFF; /* Default white */
-    if (rop == 0x00000042) fill_color = 0x00000000; /* BLACKNESS */
-    else if (rop == 0x00FF0062) fill_color = 0x00FFFFFF; /* WHITENESS */
+    uint32_t fill_color = 0xFFFFFFFF; /* Default white */
+    if (rop == 0x00000042) fill_color = 0xFF000000; /* BLACKNESS */
+    else if (rop == 0x00FF0062) fill_color = 0xFFFFFFFF; /* WHITENESS */
     else {
         gdi_object_t *br = gdi_get_obj((H_HANDLE)dc->selected_brush);
-        if (br) fill_color = br->brush.color;
+        if (br) fill_color = br->brush.color | 0xFF000000;
     }
 
     for (int cy = y; cy < y + h; cy++) {
@@ -446,7 +450,7 @@ static uint32_t gdi_SetPixel(win32_process_t *proc, uint32_t *args) {
     if (!bm || !bm->bitmap.bits) return 0;
 
     if (x >= 0 && x < bm->bitmap.width && y >= 0 && y < bm->bitmap.height) {
-        *(uint32_t *)(bm->bitmap.bits + (y * bm->bitmap.stride) + (x * 4)) = color;
+        *(uint32_t *)(bm->bitmap.bits + (y * bm->bitmap.stride) + (x * 4)) = color | 0xFF000000;
     }
     return color;
 }
@@ -479,9 +483,9 @@ static uint32_t gdi_TextOutA(win32_process_t *proc, uint32_t *args) {
                 if (px < 0 || px >= bm->bitmap.width) continue;
 
                 if (row & (0x80 >> gx)) {
-                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->text_color;
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->text_color | 0xFF000000;
                 } else if (dc->bk_mode == 2) { /* OPAQUE */
-                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->bk_color;
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->bk_color | 0xFF000000;
                 }
             }
         }
@@ -614,7 +618,7 @@ static uint32_t gdi_SetDIBitsToDevice(win32_process_t *proc, uint32_t *args) {
                 color = *(uint32_t *)(&line_buf[src_x * 4]);
             }
 
-            *(uint32_t *)(bm_dst->bitmap.bits + dest_y * bm_dst->bitmap.stride + dest_x * 4) = color;
+            *(uint32_t *)(bm_dst->bitmap.bits + dest_y * bm_dst->bitmap.stride + dest_x * 4) = color | 0xFF000000;
         }
     }
 
@@ -676,9 +680,9 @@ static uint32_t gdi_LineTo(win32_process_t *proc, uint32_t *args) {
     gdi_object_t *bm = gdi_get_obj((H_HANDLE)dc->selected_bitmap);
     if (!bm || !bm->bitmap.bits) return 0;
 
-    uint32_t pen_color = 0x00000000;
+    uint32_t pen_color = 0xFF000000;
     gdi_object_t *pen = gdi_get_obj((H_HANDLE)dc->selected_pen);
-    if (pen) pen_color = pen->pen.color;
+    if (pen) pen_color = pen->pen.color | 0xFF000000;
 
     int x0 = dc->cur_x;
     int y0 = dc->cur_y;
@@ -750,6 +754,89 @@ static uint32_t gdi_GetObjectW(win32_process_t *proc, uint32_t *args) {
     return 0;
 }
 
+static uint32_t gdi_PtVisible(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t gdi_SetBrushOrgEx(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t gdi_GetTextMetricsW(win32_process_t *proc, uint32_t *args) {
+    uint32_t tm_va = args[1];
+    if (tm_va) {
+        uint8_t tm_buf[60] = {0};
+        int32_t h = 16, asc = 13, desc = 3, avg_w = 8, max_w = 8;
+        memcpy(tm_buf + 0, &h, 4);
+        memcpy(tm_buf + 4, &asc, 4);
+        memcpy(tm_buf + 8, &desc, 4);
+        memcpy(tm_buf + 20, &avg_w, 4);
+        memcpy(tm_buf + 24, &max_w, 4);
+        guest_mem_write(&proc->mem, tm_va, tm_buf, sizeof(tm_buf));
+    }
+    return 1;
+}
+
+static uint32_t gdi_GetTextExtentPoint32W(win32_process_t *proc, uint32_t *args) {
+    int c = (int)args[2];
+    uint32_t size_va = args[3];
+    if (size_va && c >= 0) {
+        int32_t sz[2] = { c * 8, 16 };
+        guest_mem_write(&proc->mem, size_va, sz, sizeof(sz));
+    }
+    return 1;
+}
+
+static uint32_t gdi_CreateFontW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return (uint32_t)gdi_alloc_obj(GDI_OBJ_FONT);
+}
+
+static uint32_t gdi_TextOutW(win32_process_t *proc, uint32_t *args) {
+    H_HDC hdc = (H_HDC)args[0];
+    int x = (int)args[1];
+    int y = (int)args[2];
+    uint32_t str_va = args[3];
+    int len = (int)args[4];
+    if (!str_va || len <= 0) return 0;
+    uint16_t wbuf[256];
+    if (len > 255) len = 255;
+    guest_mem_read(&proc->mem, str_va, wbuf, len * 2);
+
+    gdi_dc_t *dc = gdi_get_dc(hdc);
+    if (!dc) return 0;
+    gdi_object_t *bm = gdi_get_obj((H_HANDLE)dc->selected_bitmap);
+    if (!bm || !bm->bitmap.bits) return 0;
+
+    for (int i = 0; i < len; i++) {
+        char ch = (char)(wbuf[i] & 0x7F);
+        if (ch < 32 || ch > 126) ch = ' ';
+        const uint8_t *glyph = GDI_FONT_8X8[ch - 32];
+        for (int gy = 0; gy < 8; gy++) {
+            int py = y + gy;
+            if (py < 0 || py >= bm->bitmap.height) continue;
+            uint8_t row = glyph[gy];
+            for (int gx = 0; gx < 8; gx++) {
+                int px = x + (i * 8) + gx;
+                if (px < 0 || px >= bm->bitmap.width) continue;
+                if (row & (0x80 >> gx)) {
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->text_color | 0xFF000000;
+                } else if (dc->bk_mode == 2) {
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->bk_color | 0xFF000000;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+static uint32_t gdi_LineDDA(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
 void gdi32_init(void) {
     memset(s_dcs, 0, sizeof(s_dcs));
     memset(s_objs, 0, sizeof(s_objs));
@@ -770,6 +857,13 @@ void gdi32_init(void) {
     win32_register_api("GDI32.DLL", "PatBlt", 0, gdi_PatBlt, 6);
     win32_register_api("GDI32.DLL", "SetPixel", 0, gdi_SetPixel, 4);
     win32_register_api("GDI32.DLL", "TextOutA", 0, gdi_TextOutA, 5);
+    win32_register_api("GDI32.DLL", "TextOutW", 0, gdi_TextOutW, 5);
+    win32_register_api("GDI32.DLL", "CreateFontW", 0, gdi_CreateFontW, 14);
+    win32_register_api("GDI32.DLL", "GetTextExtentPoint32W", 0, gdi_GetTextExtentPoint32W, 4);
+    win32_register_api("GDI32.DLL", "GetTextMetricsW", 0, gdi_GetTextMetricsW, 2);
+    win32_register_api("GDI32.DLL", "PtVisible", 0, gdi_PtVisible, 3);
+    win32_register_api("GDI32.DLL", "SetBrushOrgEx", 0, gdi_SetBrushOrgEx, 4);
+    win32_register_api("GDI32.DLL", "LineDDA", 0, gdi_LineDDA, 6);
     win32_register_api("GDI32.DLL", "SetTextColor", 0, gdi_SetTextColor, 2);
     win32_register_api("GDI32.DLL", "SetBkColor", 0, gdi_SetBkColor, 2);
     win32_register_api("GDI32.DLL", "SetBkMode", 0, gdi_SetBkMode, 2);

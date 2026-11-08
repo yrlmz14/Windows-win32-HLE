@@ -5,6 +5,7 @@
 #include "advapi32.h"
 #include "comdlg32.h"
 #include "msvcrt.h"
+#include "cards.h"
 #include <strings.h>
 
 #define MAX_HLE_APIS 512
@@ -118,5 +119,6 @@ void win32_init_subsystem(win32_process_t *proc) {
     advapi32_init();
     comdlg32_init();
     msvcrt_init();
+    cards_init();
     LOGI("Win32 Subsystem initialized with %d native API handlers", s_api_count);
 }

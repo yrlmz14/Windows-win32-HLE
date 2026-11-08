@@ -83,11 +83,15 @@ int main(int argc, char **argv) {
 
         /* Execute batch of x86 instructions for loaded Win32 process */
         if (s_has_loaded_app && s_proc.cpu.running) {
-            for (int i = 0; i < 5000 && s_proc.cpu.running; i++) {
+            for (int i = 0; i < 50000 && s_proc.cpu.running; i++) {
                 if ((s_proc.cpu.regs.eip & HLE_API_MASK) == HLE_API_BASE) {
                     uint32_t api_id = s_proc.cpu.regs.eip & ~HLE_API_MASK;
                     win32_dispatch_api(&s_proc, api_id);
                     screen_dirty = true;
+                    if (s_proc.cpu.yielded) {
+                        s_proc.cpu.yielded = false;
+                        break;
+                    }
                     continue;
                 }
                 x86_step(&s_proc.cpu);

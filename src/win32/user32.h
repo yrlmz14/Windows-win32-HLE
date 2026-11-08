@@ -27,6 +27,7 @@ typedef struct {
     DWORD style;
     DWORD ex_style;
     int x, y, width, height;
+    int client_x, client_y, client_w, client_h;
     bool visible;
     bool enabled;
     H_HMENU menu;

@@ -44,6 +44,15 @@ static uint32_t crt_controlfp(win32_process_t *proc, uint32_t *args) {
     return 0x0008001F; /* Standard default x87 control word */
 }
 
+static uint32_t crt_time(win32_process_t *proc, uint32_t *args) {
+    uint32_t timer_va = args[0];
+    uint32_t t = (uint32_t)time(NULL);
+    if (timer_va) {
+        guest_mem_write(&proc->mem, timer_va, &t, 4);
+    }
+    return t;
+}
+
 static uint32_t crt_initterm(win32_process_t *proc, uint32_t *args) {
     uint32_t start_va = args[0];
     uint32_t end_va = args[1];
@@ -454,6 +463,8 @@ void msvcrt_init(void) {
 
     win32_register_api("msvcrt.dll", "srand", 0, crt_srand, 1);
     win32_register_api("msvcrt.dll", "rand", 0, crt_rand, 0);
+    win32_register_api("msvcrt.dll", "time", 0, crt_time, 1);
+    win32_register_api("msvcrt.dll", "_time32", 0, crt_time, 1);
     win32_register_api("msvcrt.dll", "exit", 0, crt_exit, 1);
     win32_register_api("msvcrt.dll", "_exit", 0, crt_exit, 1);
     win32_register_api("msvcrt.dll", "_cexit", 0, crt_dummy_zero, 0);

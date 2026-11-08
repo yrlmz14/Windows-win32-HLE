@@ -18,6 +18,7 @@ typedef struct {
 } hle_api_entry_t;
 
 /* Registry lookup */
+void win32_register_api(const char *dll, const char *name, uint16_t ordinal, hle_api_fn handler, uint8_t arg_count);
 int  win32_register_or_find_api(const char *dll_name, const char *func_name, uint16_t ordinal);
 bool win32_dispatch_api(win32_process_t *proc, uint32_t api_id);
 

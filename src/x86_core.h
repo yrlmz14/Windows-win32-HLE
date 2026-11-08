@@ -35,6 +35,7 @@ typedef bool (*x86_mem_write_fn)(x86_context_t *ctx, uint32_t va, const void *bu
 struct x86_context_t {
     x86_regs_t regs;
     bool       running;
+    bool       yielded;
     uint32_t   exit_code;
     uint64_t   instructions_run;
     uint32_t   tib_data[64];

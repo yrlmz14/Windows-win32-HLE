@@ -22,7 +22,8 @@ SRCS = src/main.c \
        src/win32/gdi32.c \
        src/win32/advapi32.c \
        src/win32/comdlg32.c \
-       src/win32/msvcrt.c
+       src/win32/msvcrt.c \
+       src/win32/cards.c
 
 PACKAGE_DIR = package/extensions/win32
 BIN_ARM     = $(PACKAGE_DIR)/bin/kindle_win32
