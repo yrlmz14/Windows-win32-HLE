@@ -11,6 +11,7 @@
 /win32_sim.exe
 /test_progman.exe
 /test_winmine.exe
+/test_*.exe
 
 # Intermediate compilation artifacts
 emulator/tiny386/.depends

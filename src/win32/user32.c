@@ -627,53 +627,82 @@ static uint32_t u32_PostMessage(win32_process_t *proc, uint32_t *args) {
 
 static uint32_t u32_PeekMessageA(win32_process_t *proc, uint32_t *args) {
     uint32_t msg_va = args[0];
-    /* uint32_t hwnd = args[1]; */
+    uint32_t filter_min = args[2];
+    uint32_t filter_max = args[3];
     uint32_t remove = args[4];
 
     WIN_MSG *out_msg = (WIN_MSG *)guest_va_to_host(&proc->mem, msg_va);
     if (!out_msg) return 0;
 
-    /* If queue is empty, poll hardware inputs so modal loops (smiley button or drag) get release/move events! */
-    if (s_msg_head == s_msg_tail) {
-        touch_poll();
-        if (touch_take_dirty()) {
-            int canvas_w, canvas_h, canvas_stride;
-            uint8_t *canvas = eink_get_canvas(&canvas_w, &canvas_h, &canvas_stride);
-            eink_clear(EINK_LIGHT_GRAY);
-            user_composite_windows(canvas, canvas_w, canvas_h, canvas_stride);
-            if (vkeyboard_is_visible()) {
-                vkeyboard_draw(canvas, canvas_w, canvas_h, canvas_stride);
-            }
-            eink_present(EINK_REFRESH_FAST);
+    /* Always poll hardware touch/mouse inputs so modal loops (e.g. smiley button) receive move/up events! */
+    touch_poll();
+    if (touch_take_dirty()) {
+        int canvas_w, canvas_h, canvas_stride;
+        uint8_t *canvas = eink_get_canvas(&canvas_w, &canvas_h, &canvas_stride);
+        eink_clear(EINK_LIGHT_GRAY);
+        user_composite_windows(canvas, canvas_w, canvas_h, canvas_stride);
+        if (vkeyboard_is_visible()) {
+            vkeyboard_draw(canvas, canvas_w, canvas_h, canvas_stride);
         }
+        eink_present(EINK_REFRESH_FAST);
     }
 
-    if (s_msg_head != s_msg_tail) {
-        *out_msg = s_msg_queue[s_msg_head];
-        if (remove & 1) { /* PM_REMOVE */
-            s_msg_head = (s_msg_head + 1) % MSG_QUEUE_CAP;
+    /* Search queue for a message matching filter */
+    int found_idx = -1;
+    int curr = s_msg_head;
+    while (curr != s_msg_tail) {
+        UINT m = s_msg_queue[curr].message;
+        bool match = true;
+        if (filter_min != 0 && m < filter_min) match = false;
+        if (filter_max != 0 && m > filter_max) match = false;
+        if (match) {
+            found_idx = curr;
+            break;
+        }
+        curr = (curr + 1) % MSG_QUEUE_CAP;
+    }
+
+    if (found_idx >= 0) {
+        *out_msg = s_msg_queue[found_idx];
+        if (remove & 1) {
+            if (found_idx == s_msg_head) {
+                s_msg_head = (s_msg_head + 1) % MSG_QUEUE_CAP;
+            } else {
+                int i = found_idx;
+                while (i != s_msg_tail) {
+                    int next = (i + 1) % MSG_QUEUE_CAP;
+                    if (next == s_msg_tail) break;
+                    s_msg_queue[i] = s_msg_queue[next];
+                    i = next;
+                }
+                s_msg_tail = (s_msg_tail - 1 + MSG_QUEUE_CAP) % MSG_QUEUE_CAP;
+            }
         }
         return 1;
     }
 
-    /* Check if any window needs WM_PAINT */
-    for (int i = 1; i < MAX_WINDOWS; i++) {
-        if (s_windows[i].in_use && s_windows[i].visible && s_windows[i].needs_redraw) {
-            if (remove & 1) {
-                s_windows[i].needs_redraw = false;
+    /* Check if any window needs WM_PAINT (only if filter allows WM_PAINT = 0x000F) */
+    bool paint_allowed = (filter_min == 0 || (filter_min <= WM_PAINT && filter_max >= WM_PAINT));
+    if (paint_allowed) {
+        for (int i = 1; i < MAX_WINDOWS; i++) {
+            if (s_windows[i].in_use && s_windows[i].visible && s_windows[i].needs_redraw) {
+                if (remove & 1) {
+                    s_windows[i].needs_redraw = false;
+                }
+                out_msg->hwnd = s_windows[i].hwnd;
+                out_msg->message = WM_PAINT;
+                out_msg->wParam = 0;
+                out_msg->lParam = 0;
+                out_msg->time = 0;
+                out_msg->pt = s_cursor_pos;
+                return 1;
             }
-            out_msg->hwnd = s_windows[i].hwnd;
-            out_msg->message = WM_PAINT;
-            out_msg->wParam = 0;
-            out_msg->lParam = 0;
-            out_msg->time = 0;
-            out_msg->pt = s_cursor_pos;
-            return 1;
         }
     }
 
-    /* Yield CPU slightly in modal PeekMessage spins */
+    /* No message matching: sleep briefly in modal loops to yield CPU, and yield batch */
     sys_sleep_ms(2);
+    if (proc) proc->cpu.yielded = true;
     return 0;
 }
 
@@ -719,10 +748,6 @@ static uint32_t u32_DefWindowProcA(win32_process_t *proc, uint32_t *args) {
     }
     if (msg == 0x0203 /* WM_LBUTTONDBLCLK */) {
         user_post_message(hwnd, 0x00A3 /* WM_NCLBUTTONDBLCLK */, 2 /* HTCAPTION */, lParam);
-        return 0;
-    }
-    if (msg == 0x0201 /* WM_LBUTTONDOWN */) {
-        user_post_message(hwnd, 0x00A1 /* WM_NCLBUTTONDOWN */, 2 /* HTCAPTION */, lParam);
         return 0;
     }
     if (msg == 0x0014 /* WM_ERASEBKGND */) {
@@ -845,9 +870,25 @@ void user_inject_mouse_down(int screen_x, int screen_y, bool right_button) {
             if (is_iconic) {
                 UINT msg = right_button ? 0x00A4 /* WM_NCRBUTTONDOWN */ : 0x00A1 /* WM_NCLBUTTONDOWN */;
                 user_post_message(w->hwnd, msg, 2 /* HTCAPTION */, lp);
-            } else if (has_caption && rel_y < w->client_y) {
+            } else if (has_caption && rel_y < 23) {
                 UINT msg = right_button ? 0x00A4 /* WM_NCRBUTTONDOWN */ : 0x00A1 /* WM_NCLBUTTONDOWN */;
                 user_post_message(w->hwnd, msg, 2 /* HTCAPTION */, lp);
+            } else if (!is_child && w->menu != 0 && rel_y >= 23 && rel_y < w->client_y) {
+                /* Menu bar item clicked */
+                int cur_x = 10;
+                int m_slot = (int)(w->menu - 0x5000);
+                if (m_slot >= 1 && m_slot < MAX_MENUS && s_menus[m_slot].in_use) {
+                    win32_menu_t *m = &s_menus[m_slot];
+                    for (int mi = 0; mi < m->item_count; mi++) {
+                        int item_w = (int)strlen(m->items[mi].title) * 8 + 14;
+                        if (rel_x >= cur_x && rel_x < cur_x + item_w) {
+                            uint32_t cmd_id = m->items[mi].id ? m->items[mi].id : 510;
+                            user_post_message(w->hwnd, WM_COMMAND, cmd_id, 0);
+                            break;
+                        }
+                        cur_x += item_w;
+                    }
+                }
             } else {
                 int cl_x = rel_x - w->client_x;
                 int cl_y = rel_y - w->client_y;
@@ -1301,6 +1342,8 @@ static uint32_t u32_InvalidateRect(win32_process_t *proc, uint32_t *args) {
     (void)proc;
     H_HWND hwnd = (H_HWND)args[0];
     if (hwnd) {
+        win32_window_t *w = user_get_window(hwnd);
+        if (w) w->needs_redraw = true;
         user_post_message(hwnd, WM_PAINT, 0, 0);
     }
     return 1;
