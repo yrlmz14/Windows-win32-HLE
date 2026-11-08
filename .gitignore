@@ -1,0 +1,34 @@
+# Build outputs and object files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.bmp
+
+# Root simulation and test executables
+/win32_sim.exe
+/test_progman.exe
+/test_winmine.exe
+
+# Intermediate compilation artifacts
+emulator/tiny386/.depends
+emulator/tiny386/.fast*
+emulator/tiny386/*.o
+emulator/tiny386/rawdraw/*.o
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Package archives and build distributions
+dist/
+build/
+*.zip
+*.tar.gz
+*.tar.xz
+*.7z
+
+# Large disk images (win95.img is >125MB, exceeding GitHub's 100MB file limit)
+*.img
