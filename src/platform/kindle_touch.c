@@ -1,6 +1,7 @@
 #include "kindle_touch.h"
 #include "eink_render.h"
 #include "vkeyboard.h"
+#include "desktop_shell.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -45,6 +46,7 @@ LRESULT CALLBACK SimWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDOWN:
             s_touch_dirty = true;
             if (vkeyboard_is_visible() && vkeyboard_handle_tap(mx, my)) return 0;
+            if (desktop_shell_handle_tap(mx, my)) return 0;
             user_inject_mouse_down(mx, my, s_right_click_toggle);
             s_right_click_toggle = false;
             return 0;
@@ -254,7 +256,12 @@ void touch_poll(void) {
             return;
         }
 
-        /* 3. Double-tap detection or normal mouse down */
+        /* 3. Desktop Shell / Start Menu / Taskbar */
+        if (desktop_shell_handle_tap(s_cur_x, s_cur_y)) {
+            return;
+        }
+
+        /* 4. Double-tap detection or normal mouse down */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         long elapsed_since_up = (now.tv_sec - s_last_up_time.tv_sec) * 1000 + (now.tv_nsec - s_last_up_time.tv_nsec) / 1000000;

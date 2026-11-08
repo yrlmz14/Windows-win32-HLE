@@ -6,6 +6,7 @@
 #include "platform/eink_render.h"
 #include "platform/kindle_touch.h"
 #include "platform/vkeyboard.h"
+#include "desktop_shell.h"
 #include <unistd.h>
 #include <signal.h>
 
@@ -45,14 +46,19 @@ int main(int argc, char **argv) {
     }
     touch_init();
     vkeyboard_init();
+    desktop_shell_init();
 
     /* 2. Initialize Win32 Subsystem */
     guest_mem_init(&s_proc.mem);
     win32_init_subsystem(&s_proc);
 
-    /* 3. Determine Initial App */
-    const char *initial_exe = (argc > 1) ? argv[1] : "apps/progman.exe";
-    win32_app_request_load(initial_exe);
+    /* 3. Determine Initial App or Open Retro 3D Menu */
+    if (argc > 1) {
+        win32_app_request_load(argv[1]);
+        desktop_shell_set_menu_open(false);
+    } else {
+        desktop_shell_set_menu_open(true);
+    }
 
     LOGI("Starting Main Win32 Event Loop...");
 
@@ -68,18 +74,27 @@ int main(int argc, char **argv) {
             strncpy(target, s_pending_app, sizeof(target) - 1);
             s_pending_app[0] = '\0';
 
+            /* Load executable */
             if (pe_load_file(&s_proc, target)) {
                 s_has_loaded_app = true;
+                desktop_shell_set_menu_open(false);
                 screen_dirty = true;
                 LOGI("Application loaded successfully!");
             } else {
                 LOGE("Failed to load application: %s", target);
+                desktop_shell_set_menu_open(true);
             }
         }
 
         /* Poll touch inputs */
         touch_poll();
         if (touch_take_dirty()) {
+            screen_dirty = true;
+        }
+
+        /* Step 3D logo rotation animation when menu is open */
+        if (desktop_shell_is_menu_open()) {
+            desktop_shell_step_anim();
             screen_dirty = true;
         }
 
@@ -98,32 +113,42 @@ int main(int argc, char **argv) {
                 }
                 x86_step(&s_proc.cpu);
             }
+
+            /* If app completed/terminated, bring back the 3D retro menu */
+            if (!s_proc.cpu.running) {
+                LOGI("Application exited cleanly. Returning to Retro Desktop Menu.");
+                s_has_loaded_app = false;
+                desktop_shell_set_menu_open(true);
+                screen_dirty = true;
+            }
         }
 
-        /* Composite Frame (only when screen is dirty or initial boot frames) */
+        /* Composite Frame */
         if (screen_dirty || frame_count <= 3) {
             screen_dirty = false;
 
             int canvas_w, canvas_h, canvas_stride;
             uint8_t *canvas = eink_get_canvas(&canvas_w, &canvas_h, &canvas_stride);
 
-            /* A. Clear Desktop Surface (Clean unbloated background) */
-            eink_clear(EINK_LIGHT_GRAY);
+            /* A. Desktop Shell (Background, 3D Rotating Logo Menu, Taskbar) */
+            desktop_shell_draw(canvas, canvas_w, canvas_h, canvas_stride);
 
-            /* B. Active Windows */
-            user_composite_windows(canvas, canvas_w, canvas_h, canvas_stride);
+            /* B. Active Windows (if not in modal launcher menu) */
+            if (!desktop_shell_is_menu_open() && s_has_loaded_app) {
+                user_composite_windows(canvas, canvas_w, canvas_h, canvas_stride);
+            }
 
             /* C. On-Screen Virtual Keyboard (if visible) */
             if (vkeyboard_is_visible()) {
                 vkeyboard_draw(canvas, canvas_w, canvas_h, canvas_stride);
             }
 
-            /* Present to E-Ink Display */
+            /* Present to E-Ink Display / Simulator */
             int refresh_mode = (frame_count == 1 || frame_count % 300 == 0) ? EINK_REFRESH_FULL : EINK_REFRESH_FAST;
             eink_present(refresh_mode);
         }
 
-        /* Yield CPU briefly for ~40 FPS UI loop */
+        /* Yield CPU briefly for ~35-40 FPS UI loop */
         sys_sleep_ms(25);
     }
 

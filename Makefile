@@ -13,6 +13,8 @@ LDFLAGS_HOST  = -lgdi32 -lm
 SRCS = src/main.c \
        src/x86_core.c \
        src/pe_loader.c \
+       src/desktop_shell.c \
+       src/win95_logo3d.c \
        src/platform/eink_render.c \
        src/platform/kindle_touch.c \
        src/platform/vkeyboard.c \
