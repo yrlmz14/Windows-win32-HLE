@@ -502,6 +502,7 @@ static uint32_t u32_ShowWindow(win32_process_t *proc, uint32_t *args) {
         w->visible = (cmd != SW_HIDE);
         w->needs_redraw = true;
         s_active_hwnd = hwnd;
+        user_post_message(hwnd, WM_PAINT, 0, 0);
         return 1;
     }
     return 0;
@@ -558,6 +559,20 @@ static uint32_t u32_GetMessageA(win32_process_t *proc, uint32_t *args) {
         return (out_msg->message != WM_QUIT);
     }
 
+    /* Check if any window needs WM_PAINT */
+    for (int i = 1; i < MAX_WINDOWS; i++) {
+        if (s_windows[i].in_use && s_windows[i].visible && s_windows[i].needs_redraw) {
+            s_windows[i].needs_redraw = false;
+            out_msg->hwnd = s_windows[i].hwnd;
+            out_msg->message = WM_PAINT;
+            out_msg->wParam = 0;
+            out_msg->lParam = 0;
+            out_msg->time = 0;
+            out_msg->pt = s_cursor_pos;
+            return 1;
+        }
+    }
+
     /* No messages queued: return WM_NULL and yield CPU */
 #ifdef _WIN32
     Sleep(10);
@@ -598,6 +613,22 @@ static uint32_t u32_PeekMessageA(win32_process_t *proc, uint32_t *args) {
             s_msg_head = (s_msg_head + 1) % MSG_QUEUE_CAP;
         }
         return 1;
+    }
+
+    /* Check if any window needs WM_PAINT */
+    for (int i = 1; i < MAX_WINDOWS; i++) {
+        if (s_windows[i].in_use && s_windows[i].visible && s_windows[i].needs_redraw) {
+            if (remove & 1) {
+                s_windows[i].needs_redraw = false;
+            }
+            out_msg->hwnd = s_windows[i].hwnd;
+            out_msg->message = WM_PAINT;
+            out_msg->wParam = 0;
+            out_msg->lParam = 0;
+            out_msg->time = 0;
+            out_msg->pt = s_cursor_pos;
+            return 1;
+        }
     }
 
     /* Yield CPU slightly in modal PeekMessage spins */

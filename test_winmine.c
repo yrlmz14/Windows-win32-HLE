@@ -5,6 +5,9 @@
 #include "win32/user32.h"
 #include <stdio.h>
 
+void win32_app_request_load(const char *path) { (void)path; }
+
+
 int main(void) {
     win32_process_t proc;
     memset(&proc, 0, sizeof(proc));
