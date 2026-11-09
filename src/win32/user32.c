@@ -44,7 +44,18 @@ H_HWND user_get_active_window(void) {
     return s_active_hwnd;
 }
 
+static bool s_windows_dirty = false;
+
+bool user_windows_take_dirty(void) {
+    bool d = s_windows_dirty;
+    s_windows_dirty = false;
+    return d;
+}
+
 void user_set_active_window(H_HWND hwnd) {
+    if (s_active_hwnd != hwnd) {
+        s_windows_dirty = true;
+    }
     s_active_hwnd = hwnd;
 }
 
@@ -571,6 +582,7 @@ static uint32_t u32_ShowWindow(win32_process_t *proc, uint32_t *args) {
     if (w) {
         w->visible = (cmd != SW_HIDE);
         w->needs_redraw = true;
+        s_windows_dirty = true;
         s_active_hwnd = hwnd;
         user_post_message(hwnd, WM_PAINT, 0, 0);
         return 1;
@@ -582,6 +594,7 @@ static uint32_t u32_UpdateWindow(win32_process_t *proc, uint32_t *args) {
     H_HWND hwnd = (H_HWND)args[0];
     win32_window_t *w = user_get_window(hwnd);
     if (w && w->visible) {
+        s_windows_dirty = true;
         /* Send WM_PAINT */
         user_send_message(proc, hwnd, WM_PAINT, 0, 0, NULL);
         return 1;
@@ -610,16 +623,6 @@ static uint32_t u32_GetMessageA(win32_process_t *proc, uint32_t *args) {
     /* If queue is empty, poll hardware touch inputs */
     if (s_msg_head == s_msg_tail) {
         touch_poll();
-        if (touch_take_dirty()) {
-            int canvas_w, canvas_h, canvas_stride;
-            uint8_t *canvas = eink_get_canvas(&canvas_w, &canvas_h, &canvas_stride);
-            eink_clear(EINK_LIGHT_GRAY);
-            user_composite_windows(canvas, canvas_w, canvas_h, canvas_stride);
-            if (vkeyboard_is_visible()) {
-                vkeyboard_draw(canvas, canvas_w, canvas_h, canvas_stride);
-            }
-            eink_present(EINK_REFRESH_FAST);
-        }
     }
 
     /* Check if queue has a message */
@@ -832,6 +835,7 @@ static uint32_t u32_BeginPaint(win32_process_t *proc, uint32_t *args) {
 
 static uint32_t u32_EndPaint(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
+    s_windows_dirty = true;
     return 1;
 }
 
@@ -853,6 +857,7 @@ static uint32_t u32_GetDC(win32_process_t *proc, uint32_t *args) {
 
 static uint32_t u32_ReleaseDC(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
+    s_windows_dirty = true;
     return 1;
 }
 
@@ -1286,6 +1291,7 @@ static uint32_t u32_MoveWindow(win32_process_t *proc, uint32_t *args) {
         }
         if (resized || bRepaint) {
             win->needs_redraw = true;
+            s_windows_dirty = true;
             user_post_message(hwnd, WM_PAINT, 0, 0);
         }
         LOGI("MoveWindow: HWND 0x%08X to [%d,%d %dx%d]", hwnd, win->x, win->y, win->width, win->height);
@@ -1413,6 +1419,7 @@ static uint32_t u32_InvalidateRect(win32_process_t *proc, uint32_t *args) {
     if (hwnd) {
         win32_window_t *w = user_get_window(hwnd);
         if (w) w->needs_redraw = true;
+        s_windows_dirty = true;
         user_post_message(hwnd, WM_PAINT, 0, 0);
     }
     return 1;
@@ -1690,6 +1697,7 @@ static uint32_t u32_SetWindowPos(win32_process_t *proc, uint32_t *args) {
                 update_window_client_area(w);
                 paint_window_decorations(w);
                 w->needs_redraw = true;
+                s_windows_dirty = true;
                 user_post_message(hwnd, WM_PAINT, 0, 0);
             }
         }

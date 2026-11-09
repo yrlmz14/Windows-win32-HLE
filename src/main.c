@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
         }
 
         /* Composite Frame */
-        if (screen_dirty || frame_count <= 3) {
+        if (screen_dirty || user_windows_take_dirty() || frame_count <= 5) {
             screen_dirty = false;
 
             int canvas_w, canvas_h, canvas_stride;

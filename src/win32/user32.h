@@ -57,6 +57,7 @@ bool user_send_message(win32_process_t *proc, H_HWND hwnd, UINT msg, WPARAM wPar
 
 /* Window Manager Compositor for E-Ink */
 void user_composite_windows(uint8_t *dest_canvas, int canvas_w, int canvas_h, int canvas_stride);
+bool user_windows_take_dirty(void);
 
 /* Touch/Mouse event injection */
 void user_inject_mouse_down(int screen_x, int screen_y, bool right_button);

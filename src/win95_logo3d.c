@@ -75,9 +75,9 @@ void win95_logo3d_render(uint8_t *canvas, int canvas_w, int canvas_h, int stride
                          int cx, int cy, float angle_y, float wave_phase) {
     if (!canvas || canvas_w <= 0 || canvas_h <= 0) return;
 
-    float pitch = 0.22f; // Slight downward tilt
-    float dist  = 3.8f;
-    float fov   = 400.0f;
+    float pitch = 0.20f; // Gentle downward perspective tilt
+    float dist  = 4.8f;  // Balanced camera distance
+    float fov   = 300.0f; // Crisp field of view without overflowing margins
 
     /* 4 quadrants of the Windows 95 flag: Red, Green, Blue, Yellow */
     float tiles[4][4] = {
