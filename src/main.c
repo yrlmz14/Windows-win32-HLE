@@ -74,6 +74,15 @@ int main(int argc, char **argv) {
             strncpy(target, s_pending_app, sizeof(target) - 1);
             s_pending_app[0] = '\0';
 
+            /* If an app was previously loaded, clean reset memory and subsystem */
+            if (s_has_loaded_app) {
+                guest_mem_free(&s_proc.mem);
+                memset(&s_proc, 0, sizeof(s_proc));
+                guest_mem_init(&s_proc.mem);
+                win32_init_subsystem(&s_proc);
+                s_has_loaded_app = false;
+            }
+
             /* Load executable */
             if (pe_load_file(&s_proc, target)) {
                 s_has_loaded_app = true;

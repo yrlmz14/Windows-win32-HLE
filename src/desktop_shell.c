@@ -250,7 +250,7 @@ void desktop_shell_draw(uint8_t *canvas, int canvas_w, int canvas_h, int stride)
 
     /* 3. System Selector Menu (when open) */
     int win_w = 752;
-    int win_h = 568;
+    int win_h = 576;
     if (win_w > canvas_w - 20) win_w = canvas_w - 20;
     if (win_h > canvas_h - 20) win_h = canvas_h - 20;
 
@@ -269,61 +269,82 @@ void desktop_shell_draw(uint8_t *canvas, int canvas_w, int canvas_h, int stride)
 
     /* Center Rotating 3D Windows 95 Logo */
     int logo_cx = canvas_w / 2;
-    int logo_cy = win_y + 115;
+    int logo_cy = win_y + 105;
     win95_logo3d_render(canvas, canvas_w, canvas_h, stride, logo_cx, logo_cy, s_anim_angle, s_anim_wave);
 
     /* Retro Branding Typography */
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 64, win_y + 194, "Microsoft", 0x40, 2);
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 100, win_y + 216, "Windows 95", 0x00, 3);
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 144, win_y + 248, "Kindle Paperwhite 5 Retro System", 0x20, 2);
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 132, win_y + 272, "E-Ink Carta 1200 | 1GB RAM | Octa-Core ARM", 0x50, 1);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 64, win_y + 178, "Microsoft", 0x40, 2);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 100, win_y + 198, "Windows 95", 0x00, 3);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 144, win_y + 228, "Kindle Paperwhite 5 Retro System", 0x20, 2);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, logo_cx - 132, win_y + 248, "E-Ink Carta 1200 | 1GB RAM | Octa-Core ARM", 0x50, 1);
 
     /* ------------------------------------------------------------------ */
-    /* Button 1: Launch Windows 95                                        */
+    /* Button 1: Boot Windows 95                                          */
     /* ------------------------------------------------------------------ */
     int btn_w = win_w - 92;
     if (btn_w > 660) btn_w = 660;
     int btn_x = (canvas_w - btn_w) / 2;
-    int btn_h = 66;
-    int btn1_y = win_y + 296;
+    int btn_h = 56;
+    int btn1_y = win_y + 266;
 
     fill_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn1_y, btn_w, btn_h, 0xD4);
     draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn1_y, btn_w, btn_h, 0xFF, 0x00);
     draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 1, btn1_y + 1, btn_w - 2, btn_h - 2, 0xEF, 0x70);
 
     /* Badge 1: [ 95 ] */
-    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x + 12, btn1_y + 9, 56, 48, 0x00);
-    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 12, btn1_y + 9, 56, 48, 0x80, 0xFF);
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 22, btn1_y + 21, "95", 0xFF, 3);
+    int badge_w = 68;
+    int badge_h = 42;
+    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn1_y + 7, badge_w, badge_h, 0x00);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn1_y + 7, badge_w, badge_h, 0x80, 0xFF);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 20, btn1_y + 16, "95", 0xFF, 3);
 
     /* Text */
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 82, btn1_y + 14, "Launch Windows 95", 0x00, 2);
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 82, btn1_y + 39,
-                       "Boot full Windows 95 PC OS (Tiny386 Hardware Emulator)", 0x40, 1);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn1_y + 10, "Boot Windows 95 (Full PC OS)", 0x00, 2);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn1_y + 33,
+                       "Authentic Windows 95 Desktop & MS-DOS (Tiny386 Hardware PC)", 0x40, 1);
 
     /* ------------------------------------------------------------------ */
-    /* Button 2: Launch Win32 HLE                                         */
+    /* Button 2: Play Minesweeper (Win32 HLE)                             */
     /* ------------------------------------------------------------------ */
-    int btn2_y = btn1_y + 76;
+    int btn2_y = btn1_y + 64;
 
     fill_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn2_y, btn_w, btn_h, 0xD4);
     draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn2_y, btn_w, btn_h, 0xFF, 0x00);
     draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 1, btn2_y + 1, btn_w - 2, btn_h - 2, 0xEF, 0x70);
 
-    /* Badge 2: [ HLE ] */
-    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x + 12, btn2_y + 9, 56, 48, 0x00);
-    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 12, btn2_y + 9, 56, 48, 0x80, 0xFF);
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 16, btn2_y + 25, "HLE", 0xFF, 2);
+    /* Badge 2: [ MINE ] */
+    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn2_y + 7, badge_w, badge_h, 0x00);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn2_y + 7, badge_w, badge_h, 0x80, 0xFF);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 12, btn2_y + 19, "MINE", 0xFF, 2);
 
     /* Text */
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 82, btn2_y + 14, "Launch Win32 HLE", 0x00, 2);
-    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 82, btn2_y + 39,
-                       "Zero-overhead native Win32 runtime (Program Manager, Games & Apps)", 0x40, 1);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn2_y + 10, "Play Minesweeper (Win32 HLE)", 0x00, 2);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn2_y + 33,
+                       "Native x86 execution of classic Minesweeper (Fast & responsive)", 0x40, 1);
+
+    /* ------------------------------------------------------------------ */
+    /* Button 3: Play Solitaire (Win32 HLE)                               */
+    /* ------------------------------------------------------------------ */
+    int btn3_y = btn2_y + 64;
+
+    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn3_y, btn_w, btn_h, 0xD4);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn3_y, btn_w, btn_h, 0xFF, 0x00);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 1, btn3_y + 1, btn_w - 2, btn_h - 2, 0xEF, 0x70);
+
+    /* Badge 3: [ SOL ] */
+    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn3_y + 7, badge_w, badge_h, 0x00);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn3_y + 7, badge_w, badge_h, 0x80, 0xFF);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 20, btn3_y + 19, "SOL", 0xFF, 2);
+
+    /* Text */
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn3_y + 10, "Play Solitaire (Win32 HLE)", 0x00, 2);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn3_y + 33,
+                       "Native x86 execution of classic Solitaire with CARDS subsystem", 0x40, 1);
 
     /* ------------------------------------------------------------------ */
     /* Utility Actions: [ FLASH SCREEN ] and [ EXIT ]                     */
     /* ------------------------------------------------------------------ */
-    int btm_y = btn2_y + 80;
+    int btm_y = btn3_y + 72;
     int sub_w = 200;
     int gap = 24;
     int total_sub = sub_w * 2 + gap;
@@ -365,7 +386,7 @@ bool desktop_shell_handle_tap(int x, int y) {
 
     /* 2. Menu Window Taps (when menu is open) */
     int win_w = 752;
-    int win_h = 568;
+    int win_h = 576;
     if (win_w > canvas_w - 20) win_w = canvas_w - 20;
     if (win_h > canvas_h - 20) win_h = canvas_h - 20;
 
@@ -374,28 +395,37 @@ bool desktop_shell_handle_tap(int x, int y) {
     int btn_w = win_w - 92;
     if (btn_w > 660) btn_w = 660;
     int btn_x = (canvas_w - btn_w) / 2;
-    int btn_h = 66;
+    int btn_h = 56;
 
-    int btn1_y = win_y + 296;
-    int btn2_y = btn1_y + 76;
+    int btn1_y = win_y + 266;
+    int btn2_y = btn1_y + 64;
+    int btn3_y = btn2_y + 64;
 
-    /* Tap Button 1: Launch Windows 95 */
+    /* Tap Button 1: Boot Windows 95 (Full PC OS) */
     if (x >= btn_x && x < btn_x + btn_w && y >= btn1_y && y < btn1_y + btn_h) {
-        LOGI("Selected: Launch Windows 95");
+        LOGI("Selected: Boot Windows 95 (Full PC OS)");
         launch_windows_95();
         return true;
     }
 
-    /* Tap Button 2: Launch Win32 HLE */
+    /* Tap Button 2: Play Minesweeper (Win32 HLE) */
     if (x >= btn_x && x < btn_x + btn_w && y >= btn2_y && y < btn2_y + btn_h) {
-        LOGI("Selected: Launch Win32 HLE");
+        LOGI("Selected: Play Minesweeper (Win32 HLE)");
         s_menu_open = false;
-        win32_app_request_load("apps/progman.exe");
+        win32_app_request_load("apps/winmine.exe");
+        return true;
+    }
+
+    /* Tap Button 3: Play Solitaire (Win32 HLE) */
+    if (x >= btn_x && x < btn_x + btn_w && y >= btn3_y && y < btn3_y + btn_h) {
+        LOGI("Selected: Play Solitaire (Win32 HLE)");
+        s_menu_open = false;
+        win32_app_request_load("apps/sol.exe");
         return true;
     }
 
     /* Tap Bottom Actions: FLASH SCREEN and EXIT */
-    int btm_y = btn2_y + 80;
+    int btm_y = btn3_y + 72;
     int sub_w = 200;
     int gap = 24;
     int total_sub = sub_w * 2 + gap;

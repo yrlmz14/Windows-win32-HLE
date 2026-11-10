@@ -5,9 +5,9 @@
 			"priority": 1,
 			"items": [
 				{ "name": "Boot Windows 95 (Full PC OS)", "priority": 1, "action": "bin/run_win95.sh", "params": "" },
-				{ "name": "Launch Minesweeper (Win32)", "priority": 2, "action": "bin/run.sh", "params": "apps/winmine.exe" },
-				{ "name": "Launch Solitaire (Win32)", "priority": 3, "action": "bin/run.sh", "params": "apps/sol.exe" },
-				{ "name": "Launch Program Manager", "priority": 4, "action": "bin/run.sh", "params": "apps/progman.exe" }
+				{ "name": "Windows 95 System Selector", "priority": 2, "action": "bin/run.sh", "params": "" },
+				{ "name": "Launch Minesweeper (Win32)", "priority": 3, "action": "bin/run.sh", "params": "apps/winmine.exe" },
+				{ "name": "Launch Solitaire (Win32)", "priority": 4, "action": "bin/run.sh", "params": "apps/sol.exe" }
 			]
 		}
 	]

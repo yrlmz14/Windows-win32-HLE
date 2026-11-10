@@ -339,33 +339,19 @@ static uint8_t *allocate_window_framebuffer(int w, int h, uint32_t bg_color) {
 
 static void update_window_client_area(win32_window_t *w) {
     if (!w) return;
-    bool is_child = (w->style & WS_CHILD) != 0;
     bool has_caption = (w->style & WS_CAPTION) == WS_CAPTION;
     bool has_border = (w->style & (WS_BORDER | WS_THICKFRAME | WS_DLGFRAME)) != 0;
-    bool is_iconic = is_child && has_caption && (w->width <= 96 && w->height <= 80);
 
-    if (is_child && !has_caption) {
-        w->client_x = 0;
-        w->client_y = 0;
-        w->client_w = w->width;
-        w->client_h = w->height;
-    } else if (is_iconic) {
-        w->client_x = 0;
-        w->client_y = 0;
-        w->client_w = w->width;
-        w->client_h = w->height;
-    } else {
-        int border = has_border ? 3 : 0;
-        int cap_h = has_caption ? 19 : 0;
-        int menu_h = (w->menu != 0 && w->height > 50) ? 20 : 0;
+    int border = has_border ? 3 : 0;
+    int cap_h = has_caption ? 19 : 0;
+    int menu_h = (w->menu != 0 && w->height > 50) ? 20 : 0;
 
-        w->client_x = border;
-        w->client_y = border + cap_h + menu_h;
-        w->client_w = w->width - border * 2;
-        w->client_h = w->height - w->client_y - border;
-        if (w->client_w < 0) w->client_w = 0;
-        if (w->client_h < 0) w->client_h = 0;
-    }
+    w->client_x = border;
+    w->client_y = border + cap_h + menu_h;
+    w->client_w = w->width - border * 2;
+    w->client_h = w->height - w->client_y - border;
+    if (w->client_w < 0) w->client_w = 0;
+    if (w->client_h < 0) w->client_h = 0;
 
     if (w->hdc && w->framebuffer) {
         gdi_dc_t *dc = gdi_get_dc(w->hdc);
@@ -392,36 +378,6 @@ static void paint_window_decorations(win32_window_t *w) {
     bool is_child = (w->style & WS_CHILD) != 0;
     bool has_caption = (w->style & WS_CAPTION) == WS_CAPTION;
     bool has_border = (w->style & (WS_BORDER | WS_THICKFRAME | WS_DLGFRAME)) != 0;
-    bool is_iconic = is_child && has_caption && (bw <= 96 && bh <= 80);
-
-    /* 1. Base window surface / background filling */
-    if (strcmp(w->class_name, "MDICLIENT") == 0) {
-        /* Standard Windows MDI Workspace */
-        fill_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFF808080);
-        return;
-    }
-
-    if (is_iconic) {
-        /* Iconic child window (e.g. desktop/group program icon):
-         * Icon pixels are drawn by DrawIcon at (bw/2 - 16, 2).
-         * Caption label is drawn centered below the 32x32 icon (y >= 36). */
-        const char *label = w->title[0] ? w->title : "";
-        if (label[0]) {
-            int text_len = (int)strlen(label);
-            int text_w = text_len * 8 + 6;
-            int text_x = (bw - text_w) / 2;
-            if (text_x < 0) text_x = 0;
-            if (text_w > bw) text_w = bw;
-            int text_y = 36;
-            if (is_active) {
-                fill_rect_argb(fb, stride, bw, bh, text_x, text_y, text_w, 14, 0xFF000080);
-                draw_text_argb(fb, stride, bw, bh, text_x + 3, text_y + 3, label, 0xFFFFFFFF);
-            } else {
-                draw_text_argb(fb, stride, bw, bh, text_x + 3, text_y + 3, label, 0xFF000000);
-            }
-        }
-        return;
-    }
 
     /* 2. Window Borders */
     if (has_border) {
@@ -892,12 +848,8 @@ void user_inject_mouse_down(int screen_x, int screen_y, bool right_button) {
 
             bool is_child = (w->style & WS_CHILD) != 0;
             bool has_caption = (w->style & WS_CAPTION) == WS_CAPTION;
-            bool is_iconic = is_child && has_caption && (w->width <= 96 && w->height <= 80);
 
-            if (is_iconic) {
-                UINT msg = right_button ? 0x00A4 /* WM_NCRBUTTONDOWN */ : 0x00A1 /* WM_NCLBUTTONDOWN */;
-                user_post_message(w->hwnd, msg, 2 /* HTCAPTION */, lp);
-            } else if (has_caption && rel_y < 23) {
+            if (has_caption && rel_y < 23) {
                 UINT msg = right_button ? 0x00A4 /* WM_NCRBUTTONDOWN */ : 0x00A1 /* WM_NCLBUTTONDOWN */;
                 user_post_message(w->hwnd, msg, 2 /* HTCAPTION */, lp);
             } else if (!is_child && w->menu != 0 && rel_y >= 23 && rel_y < w->client_y) {
@@ -964,10 +916,10 @@ void user_inject_mouse_dblclk(int screen_x, int screen_y) {
             LPARAM lp = (uint32_t)(rel_y << 16) | (uint16_t)rel_x;
 
             bool is_child = (w->style & WS_CHILD) != 0;
+            (void)is_child;
             bool has_caption = (w->style & WS_CAPTION) == WS_CAPTION;
-            bool is_iconic = is_child && has_caption && (w->width <= 96 && w->height <= 80);
 
-            if (is_iconic || (has_caption && rel_y < 22)) {
+            if (has_caption && rel_y < 22) {
                 user_post_message(w->hwnd, 0x00A3 /* WM_NCLBUTTONDBLCLK */, 2 /* HTCAPTION */, lp);
             } else {
                 int cl_x = rel_x - w->client_x;
@@ -1015,9 +967,6 @@ void user_composite_windows(uint8_t *dest_canvas, int canvas_w, int canvas_h, in
     for (int i = 1; i < MAX_WINDOWS; i++) {
         if (!s_windows[i].in_use || !s_windows[i].visible || !s_windows[i].framebuffer) continue;
         win32_window_t *w = &s_windows[i];
-        bool is_child = (w->style & WS_CHILD) != 0;
-        bool has_caption = (w->style & WS_CAPTION) == WS_CAPTION;
-        bool is_iconic = is_child && has_caption && (w->width <= 96 && w->height <= 80);
 
         int sx = 0, sy = 0;
         get_window_screen_pos(w, &sx, &sy);
@@ -1032,10 +981,6 @@ void user_composite_windows(uint8_t *dest_canvas, int canvas_w, int canvas_h, in
                 if (dx < 0 || dx >= canvas_w) continue;
 
                 uint32_t px = *(uint32_t *)(w->framebuffer + (y * w->fb_stride) + (x * 4));
-                /* Skip uninitialized / transparent pixels (alpha == 0) ONLY for iconic child windows */
-                uint8_t a = (px >> 24) & 0xFF;
-                if (is_iconic && a == 0) continue;
-
                 uint8_t r = (px >> 16) & 0xFF;
                 uint8_t g = (px >> 8) & 0xFF;
                 uint8_t b = px & 0xFF;
@@ -1132,32 +1077,10 @@ static uint32_t u32_CreateWindowExW(win32_process_t *proc, uint32_t *args) {
     }
 
     /* Standard Win32 default coordinates */
-    if (strcmp(class_name, "MDICLIENT") == 0) {
-        x = 4;
-        y = 44;
-        if (parent) {
-            win32_window_t *pw = user_get_window(parent);
-            if (pw) {
-                w = pw->width - 8;
-                h = pw->height - 48;
-            }
-        }
-    } else {
-        bool is_child = (parent != 0);
-        bool is_iconic = is_child && ((style & WS_CAPTION) == WS_CAPTION) && (w <= 0 || w == (int)0x80000000 || w <= 96);
-        if (is_iconic) {
-            if (w <= 0 || w == (int)0x80000000) w = 76;
-            if (h <= 0 || h == (int)0x80000000) h = 60;
-        } else if (is_child) {
-            if (w <= 0 || w == (int)0x80000000) w = 400;
-            if (h <= 0 || h == (int)0x80000000) h = 260;
-        } else {
-            if (x == (int)0x80000000 || x < 0) x = (DEFAULT_SCREEN_W > 640) ? (DEFAULT_SCREEN_W - 640) / 2 : 40;
-            if (y == (int)0x80000000 || y < 0) y = (DEFAULT_SCREEN_H > 480) ? (DEFAULT_SCREEN_H - 480) / 2 : 40;
-            if (w <= 0 || w == (int)0x80000000) w = 640;
-            if (h <= 0 || h == (int)0x80000000) h = 480;
-        }
-    }
+    if (x == (int)0x80000000 || x < 0) x = (DEFAULT_SCREEN_W > 640) ? (DEFAULT_SCREEN_W - 640) / 2 : 40;
+    if (y == (int)0x80000000 || y < 0) y = (DEFAULT_SCREEN_H > 480) ? (DEFAULT_SCREEN_H - 480) / 2 : 40;
+    if (w <= 0 || w == (int)0x80000000) w = 640;
+    if (h <= 0 || h == (int)0x80000000) h = 480;
 
     int slot = -1;
     for (int i = 1; i < MAX_WINDOWS; i++) {
