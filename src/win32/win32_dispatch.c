@@ -45,6 +45,28 @@ int win32_register_or_find_api(const char *dll_name, const char *func_name, uint
         }
     }
 
+    /* 1.5. If func_name is given, search across all registered APIs
+     * (resolves ApiSet forwards such as api-ms-win-core-* -> KERNEL32, api-ms-win-crt-* -> msvcrt, etc.) */
+    if (func_name) {
+        for (int i = 0; i < s_api_count; i++) {
+            if (s_api_table[i].func_name && strcasecmp(s_api_table[i].func_name, func_name) == 0 &&
+                s_api_table[i].handler != fallback_unimplemented_api) {
+                return i;
+            }
+        }
+
+        /* 1.6. Check if modern UCRT private prefix '_o_' is present (e.g. _o_malloc -> malloc) */
+        if (strncmp(func_name, "_o_", 3) == 0) {
+            const char *clean_name = func_name + 3;
+            for (int i = 0; i < s_api_count; i++) {
+                if (s_api_table[i].func_name && strcasecmp(s_api_table[i].func_name, clean_name) == 0 &&
+                    s_api_table[i].handler != fallback_unimplemented_api) {
+                    return i;
+                }
+            }
+        }
+    }
+
     /* 2. Fallback: dynamically register stub */
     if (s_api_count < MAX_HLE_APIS) {
         int idx = s_api_count++;
@@ -96,8 +118,13 @@ bool win32_dispatch_api(win32_process_t *proc, uint32_t api_id) {
     /* Return value placed in EAX */
     proc->cpu.regs.eax = ret_val;
 
-    /* Stack unwinding: msvcrt is __cdecl (caller pops args), Windows DLLs are __stdcall */
+    /* Stack unwinding: msvcrt and CRT functions are __cdecl (caller pops args), Windows DLLs are __stdcall */
     bool is_cdecl = (strcasecmp(entry->dll_name, "msvcrt.dll") == 0 ||
+                     strcasecmp(entry->dll_name, "ucrtbase.dll") == 0 ||
+                     strcasecmp(entry->dll_name, "vcruntime140.dll") == 0 ||
+                     strncasecmp(entry->dll_name, "api-ms-win-crt-", 15) == 0 ||
+                     strncmp(entry->func_name, "_o_", 3) == 0 ||
+                     strncmp(entry->func_name, "__stdio_", 8) == 0 ||
                      strcasecmp(entry->func_name, "wsprintfW") == 0 ||
                      strcasecmp(entry->func_name, "wsprintfA") == 0);
     if (is_cdecl) {

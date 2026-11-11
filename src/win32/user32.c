@@ -68,8 +68,8 @@ static void get_window_screen_pos(win32_window_t *w, int *out_x, int *out_y) {
     while (cur_parent != 0) {
         win32_window_t *pw = user_get_window(cur_parent);
         if (!pw) break;
-        sx += pw->x;
-        sy += pw->y;
+        sx += pw->x + pw->client_x;
+        sy += pw->y + pw->client_y;
         cur_parent = pw->parent;
     }
     *out_x = sx;
@@ -507,7 +507,8 @@ static uint32_t u32_CreateWindowExA(win32_process_t *proc, uint32_t *args) {
     /* Allocate Window DC and Framebuffer surface */
     win->hdc = gdi_create_window_dc(hwnd);
     win->fb_stride = w * 4;
-    win->framebuffer = allocate_window_framebuffer(w, h, 0xFFC0C0C0);
+    uint32_t bg_col = (strcasecmp(win->class_name, "Edit") == 0) ? 0xFFFFFFFF : 0xFFC0C0C0;
+    win->framebuffer = allocate_window_framebuffer(w, h, bg_col);
 
     /* Point window DC's default bitmap to window client area */
     gdi_dc_t *dc = gdi_get_dc(win->hdc);
@@ -1116,7 +1117,8 @@ static uint32_t u32_CreateWindowExW(win32_process_t *proc, uint32_t *args) {
 
     win->hdc = gdi_create_window_dc(hwnd);
     win->fb_stride = w * 4;
-    win->framebuffer = allocate_window_framebuffer(w, h, 0xFFC0C0C0);
+    uint32_t bg_col = (strcasecmp(win->class_name, "Edit") == 0) ? 0xFFFFFFFF : 0xFFC0C0C0;
+    win->framebuffer = allocate_window_framebuffer(w, h, bg_col);
 
     gdi_dc_t *dc = gdi_get_dc(win->hdc);
     if (dc) {
@@ -1644,6 +1646,24 @@ static uint32_t u32_SetWindowTextA(win32_process_t *proc, uint32_t *args) {
     }
     return 0;
 }
+static uint32_t u32_SetWindowTextW(win32_process_t *proc, uint32_t *args) {
+    H_HWND hwnd = args[0];
+    uint32_t wtitle_va = args[1];
+    win32_window_t *w = user_get_window(hwnd);
+    if (w && wtitle_va) {
+        uint16_t wbuf[128] = {0};
+        guest_mem_read(&proc->mem, wtitle_va, wbuf, sizeof(wbuf));
+        wchar_to_ascii(wbuf, w->title, sizeof(w->title));
+        paint_window_decorations(w);
+        w->needs_redraw = true;
+        return 1;
+    }
+    return 0;
+}
+static uint32_t u32_MonitorFromWindow(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0x00010001; /* HMONITOR */
+}
 static uint32_t u32_GetWindowTextA(win32_process_t *proc, uint32_t *args) {
     H_HWND hwnd = args[0];
     char *out_buf = (char *)guest_va_to_host(&proc->mem, args[1]);
@@ -1925,6 +1945,270 @@ static uint32_t u32_LoadStringA(win32_process_t *proc, uint32_t *args) {
         return (uint32_t)strlen(buf);
     }
     return 0;
+}
+
+static uint32_t u32_CreateStatusWindowW(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    H_HWND hwndParent = (H_HWND)args[2];
+    int slot = -1;
+    for (int i = 1; i < MAX_WINDOWS; i++) {
+        if (!s_windows[i].in_use) { slot = i; break; }
+    }
+    if (slot == -1) return 0;
+    H_HWND hwnd = (H_HWND)(0x4000 + slot);
+    win32_window_t *w = &s_windows[slot];
+    memset(w, 0, sizeof(*w));
+    w->in_use = true;
+    w->hwnd = hwnd;
+    w->parent = hwndParent;
+    w->visible = true;
+    w->width = 640;
+    w->height = 20;
+    strcpy(w->class_name, "msctls_statusbar32");
+    return (uint32_t)hwnd;
+}
+
+static uint32_t u32_CharUpperW(win32_process_t *proc, uint32_t *args) {
+    uint32_t ptr = args[0];
+    if ((ptr & 0xFFFF0000) == 0) {
+        uint16_t ch = (uint16_t)ptr;
+        if (ch >= 'a' && ch <= 'z') ch -= ('a' - 'A');
+        return (uint32_t)ch;
+    }
+    uint16_t *str = (uint16_t *)guest_va_to_host(&proc->mem, ptr);
+    if (str) {
+        while (*str) {
+            if (*str >= 'a' && *str <= 'z') *str -= ('a' - 'A');
+            str++;
+        }
+    }
+    return ptr;
+}
+
+static uint32_t u32_CharNextW(win32_process_t *proc, uint32_t *args) {
+    uint32_t ptr = args[0];
+    if (!ptr) return 0;
+    uint16_t ch = 0;
+    guest_mem_read(&proc->mem, ptr, &ch, 2);
+    return ch ? (ptr + 2) : ptr;
+}
+
+static uint32_t u32_SetCursor(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0x00010001; /* HCURSOR */
+}
+
+static uint32_t u32_GetFocus(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return (uint32_t)s_active_hwnd;
+}
+
+static uint32_t u32_GetForegroundWindow(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return (uint32_t)s_active_hwnd;
+}
+
+static uint32_t u32_IsWindow(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    H_HWND hwnd = (H_HWND)args[0];
+    win32_window_t *w = user_get_window(hwnd);
+    return (w && w->in_use) ? 1 : 0;
+}
+
+static uint32_t u32_GetWindowPlacement(win32_process_t *proc, uint32_t *args) {
+    H_HWND hwnd = (H_HWND)args[0];
+    uint32_t lpwndpl = args[1];
+    win32_window_t *w = user_get_window(hwnd);
+    if (w && lpwndpl) {
+        uint32_t pl[11] = {0};
+        pl[0] = 44;
+        pl[1] = 0;
+        pl[2] = 1; /* SW_SHOWNORMAL */
+        pl[7] = w->x;
+        pl[8] = w->y;
+        pl[9] = w->x + w->width;
+        pl[10] = w->y + w->height;
+        guest_mem_write(&proc->mem, lpwndpl, pl, sizeof(pl));
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t u32_SetWindowPlacement(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_GetWindowTextW(win32_process_t *proc, uint32_t *args) {
+    H_HWND hwnd = (H_HWND)args[0];
+    uint32_t out_va = args[1];
+    int max_count = (int)args[2];
+    win32_window_t *w = user_get_window(hwnd);
+    if (!w || !out_va || max_count <= 0) return 0;
+    int len = (int)strlen(w->title);
+    if (len >= max_count) len = max_count - 1;
+    uint16_t wbuf[128] = {0};
+    for (int i = 0; i < len; i++) wbuf[i] = (uint8_t)w->title[i];
+    wbuf[len] = 0;
+    guest_mem_write(&proc->mem, out_va, wbuf, (len + 1) * sizeof(uint16_t));
+    return len;
+}
+
+static uint32_t u32_GetWindowTextLengthW(win32_process_t *proc, uint32_t *args) {
+    H_HWND hwnd = (H_HWND)args[0];
+    win32_window_t *w = user_get_window(hwnd);
+    return w ? (uint32_t)strlen(w->title) : 0;
+}
+
+static uint32_t u32_GetSystemMenu(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0x00020001; /* HMENU */
+}
+
+static uint32_t u32_SetWinEventHook(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0x00010001; /* HWINEVENTHOOK */
+}
+
+static uint32_t u32_UnhookWinEvent(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_IsDialogMessageW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0; /* Not a dialog message */
+}
+
+static uint32_t u32_DispatchMessageW(win32_process_t *proc, uint32_t *args) {
+    return u32_DispatchMessageA(proc, args);
+}
+
+static uint32_t u32_GetMessageW(win32_process_t *proc, uint32_t *args) {
+    return u32_GetMessageA(proc, args);
+}
+
+static uint32_t u32_PeekMessageW(win32_process_t *proc, uint32_t *args) {
+    return u32_PeekMessageA(proc, args);
+}
+
+static uint32_t u32_RedrawWindow(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    H_HWND hwnd = (H_HWND)args[0];
+    win32_window_t *w = user_get_window(hwnd);
+    if (w) {
+        w->needs_redraw = true;
+        s_windows_dirty = true;
+        user_post_message(hwnd, WM_PAINT, 0, 0);
+    }
+    return 1;
+}
+
+static uint32_t u32_SetScrollPos(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    return args[2]; /* Return previous pos */
+}
+
+static uint32_t u32_GetDlgCtrlID(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    H_HWND hwnd = (H_HWND)args[0];
+    win32_window_t *w = user_get_window(hwnd);
+    return w ? (uint32_t)(uintptr_t)w->menu : 0;
+}
+
+static uint32_t u32_GetKeyboardLayout(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0x04090409; /* US English HKL */
+}
+
+static uint32_t u32_TrackMouseEvent(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_DestroyIcon(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_MessageBeep(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_GetPropW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0;
+}
+
+static uint32_t u32_SetPropW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_RemovePropW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0;
+}
+
+static uint32_t u32_OpenClipboard(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_IsClipboardFormatAvailable(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0;
+}
+
+static uint32_t u32_CloseClipboard(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_DrawFocusRect(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_DrawTextExW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 16;
+}
+
+static uint32_t u32_NotifyWinEvent(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0;
+}
+
+static uint32_t u32_FillRect(win32_process_t *proc, uint32_t *args) {
+    H_HDC hdc = (H_HDC)args[0];
+    uint32_t lprc_va = args[1];
+    H_HBRUSH hbr = (H_HBRUSH)args[2];
+    WIN_RECT rc;
+    if (!guest_mem_read(&proc->mem, lprc_va, &rc, sizeof(rc))) return 0;
+    gdi_dc_t *dc = gdi_get_dc(hdc);
+    if (!dc) return 0;
+    gdi_object_t *bm = gdi_get_obj((H_HANDLE)dc->selected_bitmap);
+    if (!bm || !bm->bitmap.bits) return 0;
+
+    uint32_t color = 0xFFC0C0C0;
+    if ((uint32_t)hbr <= 32) {
+        if ((uint32_t)hbr == 6) color = 0xFFFFFFFF; /* COLOR_WINDOW */
+        else if ((uint32_t)hbr == 16) color = 0xFFC0C0C0; /* COLOR_BTNFACE */
+    } else {
+        gdi_object_t *br = gdi_get_obj((H_HANDLE)hbr);
+        if (br && br->type == GDI_OBJ_BRUSH) color = br->brush.color | 0xFF000000;
+    }
+
+    for (int y = rc.top; y < rc.bottom; y++) {
+        if (y < 0 || y >= bm->bitmap.height) continue;
+        for (int x = rc.left; x < rc.right; x++) {
+            if (x < 0 || x >= bm->bitmap.width) continue;
+            *(uint32_t *)(bm->bitmap.bits + (y * bm->bitmap.stride) + (x * 4)) = color;
+        }
+    }
+    return 1;
 }
 
 static uint32_t dummy_ShellAboutW(win32_process_t *proc, uint32_t *args) {
@@ -2305,6 +2589,8 @@ void user32_init_apis(void) {
     win32_register_api("USER32.DLL", "SetWindowLongW", 0, u32_SetWindowLongW, 3);
     win32_register_api("USER32.DLL", "SetWindowPos", 0, u32_SetWindowPos, 7);
     win32_register_api("USER32.DLL", "SetWindowTextA", 0, u32_SetWindowTextA, 2);
+    win32_register_api("USER32.DLL", "SetWindowTextW", 0, u32_SetWindowTextW, 2);
+    win32_register_api("USER32.DLL", "MonitorFromWindow", 0, u32_MonitorFromWindow, 2);
     win32_register_api("USER32.DLL", "GetWindowTextA", 0, u32_GetWindowTextA, 3);
     win32_register_api("USER32.DLL", "GetClientRect", 0, u32_GetClientRect, 2);
     win32_register_api("USER32.DLL", "DrawIcon", 0, u32_DrawIcon, 4);
@@ -2352,7 +2638,44 @@ void user32_init_apis(void) {
     win32_register_api("USER32.DLL", "MsgWaitForMultipleObjects", 0, u32_MsgWaitForMultipleObjects, 5);
     win32_register_api("USER32.DLL", "DrawTextW", 0, u32_DrawTextW, 5);
 
+    win32_register_api("USER32.DLL", "CharUpperW", 0, u32_CharUpperW, 1);
+    win32_register_api("USER32.DLL", "CharNextW", 0, u32_CharNextW, 1);
+    win32_register_api("USER32.DLL", "SetCursor", 0, u32_SetCursor, 1);
+    win32_register_api("USER32.DLL", "GetFocus", 0, u32_GetFocus, 0);
+    win32_register_api("USER32.DLL", "GetForegroundWindow", 0, u32_GetForegroundWindow, 0);
+    win32_register_api("USER32.DLL", "IsWindow", 0, u32_IsWindow, 1);
+    win32_register_api("USER32.DLL", "GetWindowPlacement", 0, u32_GetWindowPlacement, 2);
+    win32_register_api("USER32.DLL", "SetWindowPlacement", 0, u32_SetWindowPlacement, 2);
+    win32_register_api("USER32.DLL", "GetWindowTextW", 0, u32_GetWindowTextW, 3);
+    win32_register_api("USER32.DLL", "GetWindowTextLengthW", 0, u32_GetWindowTextLengthW, 1);
+    win32_register_api("USER32.DLL", "GetSystemMenu", 0, u32_GetSystemMenu, 2);
+    win32_register_api("USER32.DLL", "SetWinEventHook", 0, u32_SetWinEventHook, 7);
+    win32_register_api("USER32.DLL", "UnhookWinEvent", 0, u32_UnhookWinEvent, 1);
+    win32_register_api("USER32.DLL", "IsDialogMessageW", 0, u32_IsDialogMessageW, 2);
+    win32_register_api("USER32.DLL", "DispatchMessageW", 0, u32_DispatchMessageW, 1);
+    win32_register_api("USER32.DLL", "GetMessageW", 0, u32_GetMessageW, 4);
+    win32_register_api("USER32.DLL", "PeekMessageW", 0, u32_PeekMessageW, 5);
+    win32_register_api("USER32.DLL", "RedrawWindow", 0, u32_RedrawWindow, 4);
+    win32_register_api("USER32.DLL", "SetScrollPos", 0, u32_SetScrollPos, 4);
+    win32_register_api("USER32.DLL", "GetDlgCtrlID", 0, u32_GetDlgCtrlID, 1);
+    win32_register_api("USER32.DLL", "GetKeyboardLayout", 0, u32_GetKeyboardLayout, 1);
+    win32_register_api("USER32.DLL", "TrackMouseEvent", 0, u32_TrackMouseEvent, 1);
+    win32_register_api("USER32.DLL", "DestroyIcon", 0, u32_DestroyIcon, 1);
+    win32_register_api("USER32.DLL", "MessageBeep", 0, u32_MessageBeep, 1);
+    win32_register_api("USER32.DLL", "GetPropW", 0, u32_GetPropW, 2);
+    win32_register_api("USER32.DLL", "SetPropW", 0, u32_SetPropW, 3);
+    win32_register_api("USER32.DLL", "RemovePropW", 0, u32_RemovePropW, 2);
+    win32_register_api("USER32.DLL", "OpenClipboard", 0, u32_OpenClipboard, 1);
+    win32_register_api("USER32.DLL", "IsClipboardFormatAvailable", 0, u32_IsClipboardFormatAvailable, 1);
+    win32_register_api("USER32.DLL", "CloseClipboard", 0, u32_CloseClipboard, 0);
+    win32_register_api("USER32.DLL", "DrawFocusRect", 0, u32_DrawFocusRect, 2);
+    win32_register_api("USER32.DLL", "DrawTextExW", 0, u32_DrawTextExW, 6);
+    win32_register_api("USER32.DLL", "NotifyWinEvent", 0, u32_NotifyWinEvent, 4);
+    win32_register_api("USER32.DLL", "FillRect", 0, u32_FillRect, 3);
+    win32_register_api("USER32.DLL", "SetActiveWindow", 0, u32_SetFocus, 1);
+
     win32_register_api("SHELL32.DLL", "ShellAboutW", 0, dummy_ShellAboutW, 4);
     win32_register_api("WINMM.DLL", "PlaySoundW", 0, dummy_PlaySoundW, 3);
     win32_register_api("COMCTL32.DLL", "InitCommonControlsEx", 0, dummy_InitCommonControlsEx, 1);
+    win32_register_api("COMCTL32.DLL", "CreateStatusWindowW", 0, u32_CreateStatusWindowW, 4);
 }

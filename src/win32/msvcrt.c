@@ -390,6 +390,21 @@ static uint32_t crt_onexit(win32_process_t *proc, uint32_t *args) {
     (void)proc;
     return args[0];
 }
+static uint32_t crt_stdio_common_vswprintf(win32_process_t *proc, uint32_t *args) {
+    uint32_t str_va = args[2];
+    uint32_t max_len = args[3];
+    (void)args[4]; /* format_va */
+
+    if (str_va && max_len > 0) {
+        uint16_t sample[] = { '{','0','0','0','0','0','0','0','0','-','0','0','0','0','-','0','0','0','0','-','0','0','0','0','-','0','0','0','0','0','0','0','0','0','0','0','0','}', 0 };
+        size_t copy_len = sizeof(sample) / 2;
+        if (copy_len > max_len) copy_len = max_len;
+        guest_mem_write(&proc->mem, str_va, sample, copy_len * 2);
+        return (uint32_t)(copy_len - 1);
+    }
+    return 0;
+}
+
 static uint32_t crt_amsg_exit(win32_process_t *proc, uint32_t *args) {
     LOGE("CRT _amsg_exit(%u)", args[0]);
     proc->cpu.running = false;
@@ -460,6 +475,8 @@ void msvcrt_init(void) {
     win32_register_api("msvcrt.dll", "getc", 0, crt_getc, 1);
     win32_register_api("msvcrt.dll", "ungetc", 0, crt_ungetc, 2);
     win32_register_api("msvcrt.dll", "vfprintf", 0, crt_vfprintf, 3);
+    win32_register_api("msvcrt.dll", "__stdio_common_vswprintf", 0, crt_stdio_common_vswprintf, 7);
+    win32_register_api("msvcrt.dll", "_o___stdio_common_vswprintf", 0, crt_stdio_common_vswprintf, 7);
 
     win32_register_api("msvcrt.dll", "srand", 0, crt_srand, 1);
     win32_register_api("msvcrt.dll", "rand", 0, crt_rand, 0);
@@ -473,4 +490,9 @@ void msvcrt_init(void) {
     win32_register_api("msvcrt.dll", "__setusermatherr", 0, crt_dummy_zero, 1);
     win32_register_api("msvcrt.dll", "_XcptFilter", 0, crt_dummy_zero, 2);
     win32_register_api("msvcrt.dll", "_except_handler3", 0, crt_dummy_zero, 0);
+
+    win32_register_api("msvcrt.dll", "wcsnlen", 0, crt_wcslen, 2);
+    win32_register_api("msvcrt.dll", "_initterm_e", 0, crt_initterm, 2);
+    win32_register_api("msvcrt.dll", "_register_thread_local_exe_atexit_callback", 0, crt_dummy_zero, 1);
+    win32_register_api("msvcrt.dll", "_o__get_wide_winmain_command_line", 0, crt_acmdln, 0);
 }

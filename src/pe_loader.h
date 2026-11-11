@@ -101,6 +101,17 @@ typedef struct {
     uint32_t FirstThunk;
 } pe_import_descriptor_t;
 
+typedef struct {
+    uint32_t Attributes;
+    uint32_t DllNameRVA;
+    uint32_t ModuleHandleRVA;
+    uint32_t ImportAddressTableRVA;
+    uint32_t ImportNameTableRVA;
+    uint32_t BoundImportAddressTableRVA;
+    uint32_t UnloadInformationTableRVA;
+    uint32_t TimeDateStamp;
+} pe_delay_descriptor_t;
+
 #pragma pack(pop)
 
 /* Memory Page Directory structure (2-level sparse virtual memory: 4 GB address space) */

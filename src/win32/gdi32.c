@@ -837,6 +837,29 @@ static uint32_t gdi_LineDDA(win32_process_t *proc, uint32_t *args) {
     return 1;
 }
 
+static uint32_t gdi_CreateFontIndirectW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0x00002001;
+}
+
+static uint32_t gdi_GetTextFaceW(win32_process_t *proc, uint32_t *args) {
+    int nCount = (int)args[1];
+    uint32_t lpFaceName = args[2];
+    static const uint16_t s_face[] = { 'L','u','c','i','d','a',' ','C','o','n','s','o','l','e',0 };
+    int len = 14;
+    if (lpFaceName && nCount > 0) {
+        int to_copy = (nCount <= len) ? (nCount - 1) : len;
+        guest_mem_write(&proc->mem, lpFaceName, s_face, (to_copy + 1) * 2);
+        return to_copy;
+    }
+    return len;
+}
+
+static uint32_t gdi_dummy_success(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
 void gdi32_init(void) {
     memset(s_dcs, 0, sizeof(s_dcs));
     memset(s_objs, 0, sizeof(s_objs));
@@ -859,6 +882,8 @@ void gdi32_init(void) {
     win32_register_api("GDI32.DLL", "TextOutA", 0, gdi_TextOutA, 5);
     win32_register_api("GDI32.DLL", "TextOutW", 0, gdi_TextOutW, 5);
     win32_register_api("GDI32.DLL", "CreateFontW", 0, gdi_CreateFontW, 14);
+    win32_register_api("GDI32.DLL", "CreateFontIndirectW", 0, gdi_CreateFontIndirectW, 1);
+    win32_register_api("GDI32.DLL", "GetTextFaceW", 0, gdi_GetTextFaceW, 3);
     win32_register_api("GDI32.DLL", "GetTextExtentPoint32W", 0, gdi_GetTextExtentPoint32W, 4);
     win32_register_api("GDI32.DLL", "GetTextMetricsW", 0, gdi_GetTextMetricsW, 2);
     win32_register_api("GDI32.DLL", "PtVisible", 0, gdi_PtVisible, 3);
@@ -875,4 +900,17 @@ void gdi32_init(void) {
     win32_register_api("GDI32.DLL", "LineTo", 0, gdi_LineTo, 3);
     win32_register_api("GDI32.DLL", "MoveToEx", 0, gdi_MoveToEx, 4);
     win32_register_api("GDI32.DLL", "SetDIBitsToDevice", 0, gdi_SetDIBitsToDevice, 12);
+
+    win32_register_api("GDI32.DLL", "SetMapMode", 0, gdi_dummy_success, 2);
+    win32_register_api("GDI32.DLL", "SetViewportExtEx", 0, gdi_dummy_success, 4);
+    win32_register_api("GDI32.DLL", "SetWindowExtEx", 0, gdi_dummy_success, 4);
+    win32_register_api("GDI32.DLL", "LPtoDP", 0, gdi_dummy_success, 3);
+    win32_register_api("GDI32.DLL", "AbortDoc", 0, gdi_dummy_success, 1);
+    win32_register_api("GDI32.DLL", "EndDoc", 0, gdi_dummy_success, 1);
+    win32_register_api("GDI32.DLL", "SetAbortProc", 0, gdi_dummy_success, 2);
+    win32_register_api("GDI32.DLL", "StartDocW", 0, gdi_dummy_success, 2);
+    win32_register_api("GDI32.DLL", "StartPage", 0, gdi_dummy_success, 1);
+    win32_register_api("GDI32.DLL", "EndPage", 0, gdi_dummy_success, 1);
+    win32_register_api("GDI32.DLL", "CreateDCW", 0, gdi_CreateCompatibleDC, 4);
+    win32_register_api("GDI32.DLL", "EnumFontsW", 0, gdi_dummy_success, 4);
 }

@@ -265,6 +265,56 @@ bool pe_load_buffer(win32_process_t *proc, const uint8_t *buf, size_t buf_size) 
         }
     }
 
+    /* 3b. Resolve Delay-Load Imports (DataDirectory[13]) */
+    if (opt->NumberOfRvaAndSizes > 13 && opt->DataDirectory[13].VirtualAddress != 0) {
+        uint32_t delay_rva = opt->DataDirectory[13].VirtualAddress;
+        uint32_t cur_desc_va = proc->image_base + delay_rva;
+
+        while (1) {
+            pe_delay_descriptor_t desc;
+            if (!guest_mem_read(&proc->mem, cur_desc_va, &desc, sizeof(desc))) break;
+            if (desc.DllNameRVA == 0 || desc.ImportAddressTableRVA == 0) break;
+
+            char dll_name[128] = {0};
+            for (int k = 0; k < 127; k++) {
+                uint8_t ch = 0;
+                if (!guest_mem_read(&proc->mem, proc->image_base + desc.DllNameRVA + k, &ch, 1) || ch == 0) break;
+                dll_name[k] = (char)ch;
+            }
+            if (dll_name[0] == '\0') strcpy(dll_name, "UNKNOWN.DLL");
+
+            uint32_t cur_int_va = proc->image_base + desc.ImportNameTableRVA;
+            uint32_t cur_iat_va = proc->image_base + desc.ImportAddressTableRVA;
+
+            while (1) {
+                uint32_t val = 0;
+                if (!guest_mem_read(&proc->mem, cur_int_va, &val, 4) || val == 0) break;
+
+                char func_name[128] = {0};
+                uint16_t ordinal = 0;
+
+                if (val & 0x80000000U) {
+                    ordinal = val & 0xFFFF;
+                } else {
+                    for (int k = 0; k < 127; k++) {
+                        uint8_t ch = 0;
+                        if (!guest_mem_read(&proc->mem, proc->image_base + val + 2 + k, &ch, 1) || ch == 0) break;
+                        func_name[k] = (char)ch;
+                    }
+                }
+
+                int api_id = win32_register_or_find_api(dll_name, func_name[0] ? func_name : NULL, ordinal);
+                uint32_t vector = HLE_API_BASE | (uint32_t)(api_id & 0xFFFF);
+                guest_mem_write(&proc->mem, cur_iat_va, &vector, 4);
+
+                cur_int_va += 4;
+                cur_iat_va += 4;
+            }
+
+            cur_desc_va += sizeof(pe_delay_descriptor_t);
+        }
+    }
+
     /* 4. Setup Stack at 0x00100000 - 0x00300000 (2 MB) */
     proc->stack_base = 0x00100000;
     proc->stack_top  = 0x00300000;

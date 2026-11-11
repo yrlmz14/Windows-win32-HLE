@@ -250,7 +250,7 @@ void desktop_shell_draw(uint8_t *canvas, int canvas_w, int canvas_h, int stride)
 
     /* 3. System Selector Menu (when open) */
     int win_w = 752;
-    int win_h = 576;
+    int win_h = 636;
     if (win_w > canvas_w - 20) win_w = canvas_w - 20;
     if (win_h > canvas_h - 20) win_h = canvas_h - 20;
 
@@ -325,7 +325,7 @@ void desktop_shell_draw(uint8_t *canvas, int canvas_w, int canvas_h, int stride)
     /* ------------------------------------------------------------------ */
     /* Button 3: Play Solitaire (Win32 HLE)                               */
     /* ------------------------------------------------------------------ */
-    int btn3_y = btn2_y + 64;
+    int btn3_y = btn2_y + 58;
 
     fill_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn3_y, btn_w, btn_h, 0xD4);
     draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn3_y, btn_w, btn_h, 0xFF, 0x00);
@@ -342,9 +342,28 @@ void desktop_shell_draw(uint8_t *canvas, int canvas_w, int canvas_h, int stride)
                        "Native x86 execution of classic Solitaire with CARDS subsystem", 0x40, 1);
 
     /* ------------------------------------------------------------------ */
+    /* Button 4: Windows 10/11 Notepad (Win32 HLE)                        */
+    /* ------------------------------------------------------------------ */
+    int btn4_y = btn3_y + 58;
+
+    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn4_y, btn_w, btn_h, 0xD4);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x, btn4_y, btn_w, btn_h, 0xFF, 0x00);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 1, btn4_y + 1, btn_w - 2, btn_h - 2, 0xEF, 0x70);
+
+    /* Badge 4: [ NOTE ] */
+    fill_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn4_y + 7, badge_w, badge_h, 0x00);
+    draw_3d_rect(canvas, canvas_w, canvas_h, stride, btn_x + 10, btn4_y + 7, badge_w, badge_h, 0x80, 0xFF);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 14, btn4_y + 19, "NOTE", 0xFF, 2);
+
+    /* Text */
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn4_y + 10, "Windows 10/11 Notepad (Win32 HLE)", 0x00, 2);
+    draw_string_scaled(canvas, canvas_w, canvas_h, stride, btn_x + 88, btn4_y + 33,
+                       "Genuine Microsoft Windows 10/11 IA-32 Notepad execution", 0x40, 1);
+
+    /* ------------------------------------------------------------------ */
     /* Utility Actions: [ FLASH SCREEN ] and [ EXIT ]                     */
     /* ------------------------------------------------------------------ */
-    int btm_y = btn3_y + 72;
+    int btm_y = btn4_y + 66;
     int sub_w = 200;
     int gap = 24;
     int total_sub = sub_w * 2 + gap;
@@ -386,7 +405,7 @@ bool desktop_shell_handle_tap(int x, int y) {
 
     /* 2. Menu Window Taps (when menu is open) */
     int win_w = 752;
-    int win_h = 576;
+    int win_h = 636;
     if (win_w > canvas_w - 20) win_w = canvas_w - 20;
     if (win_h > canvas_h - 20) win_h = canvas_h - 20;
 
@@ -399,7 +418,8 @@ bool desktop_shell_handle_tap(int x, int y) {
 
     int btn1_y = win_y + 266;
     int btn2_y = btn1_y + 64;
-    int btn3_y = btn2_y + 64;
+    int btn3_y = btn2_y + 58;
+    int btn4_y = btn3_y + 58;
 
     /* Tap Button 1: Boot Windows 95 (Full PC OS) */
     if (x >= btn_x && x < btn_x + btn_w && y >= btn1_y && y < btn1_y + btn_h) {
@@ -424,8 +444,16 @@ bool desktop_shell_handle_tap(int x, int y) {
         return true;
     }
 
+    /* Tap Button 4: Windows 10/11 Notepad (Win32 HLE) */
+    if (x >= btn_x && x < btn_x + btn_w && y >= btn4_y && y < btn4_y + btn_h) {
+        LOGI("Selected: Windows 10/11 Notepad (Win32 HLE)");
+        s_menu_open = false;
+        win32_app_request_load("apps/notepad10.exe");
+        return true;
+    }
+
     /* Tap Bottom Actions: FLASH SCREEN and EXIT */
-    int btm_y = btn3_y + 72;
+    int btm_y = btn4_y + 66;
     int sub_w = 200;
     int gap = 24;
     int total_sub = sub_w * 2 + gap;

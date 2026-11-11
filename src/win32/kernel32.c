@@ -95,21 +95,32 @@ static uint32_t k32_GetProcessHeap(win32_process_t *proc, uint32_t *args) {
     return 0x00010000; /* Process Heap Handle */
 }
 
+typedef struct {
+    uint32_t magic;
+    uint32_t size;
+} heap_hdr_t;
+
 uint32_t k32_HeapAlloc(win32_process_t *proc, uint32_t *args) {
     /* uint32_t heap = args[0]; */
     uint32_t flags = args[1];
     uint32_t bytes = args[2];
+    uint32_t total = bytes + sizeof(heap_hdr_t);
 
     uint32_t addr = s_heap_cursor;
-    uint32_t aligned = (bytes + 4095) & ~4095;
+    uint32_t aligned = (total + 4095) & ~4095;
     s_heap_cursor += aligned;
 
-    guest_mem_commit(&proc->mem, addr, bytes);
-    uint8_t *p = guest_va_to_host(&proc->mem, addr);
+    guest_mem_commit(&proc->mem, addr, total);
+    heap_hdr_t *hdr = (heap_hdr_t *)guest_va_to_host(&proc->mem, addr);
+    if (hdr) {
+        hdr->magic = 0x48454150;
+        hdr->size = bytes;
+    }
+    uint8_t *p = guest_va_to_host(&proc->mem, addr + sizeof(heap_hdr_t));
     if (p && (flags & 0x00000008)) { /* HEAP_ZERO_MEMORY */
         memset(p, 0, bytes);
     }
-    return addr;
+    return addr + sizeof(heap_hdr_t);
 }
 
 static uint32_t k32_HeapFree(win32_process_t *proc, uint32_t *args) {
@@ -609,6 +620,64 @@ static uint32_t k32_LocalReAlloc(win32_process_t *proc, uint32_t *args) {
     }
     return new_va;
 }
+static uint32_t k32_LocalSize(win32_process_t *proc, uint32_t *args) {
+    uint32_t addr = args[0];
+    if (addr >= sizeof(heap_hdr_t)) {
+        heap_hdr_t *hdr = (heap_hdr_t *)guest_va_to_host(&proc->mem, addr - sizeof(heap_hdr_t));
+        if (hdr && hdr->magic == 0x48454150) {
+            return hdr->size;
+        }
+    }
+    return 4096;
+}
+
+static uint32_t k32_IsProcessorFeaturePresent(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    uint32_t feat = args[0];
+    switch (feat) {
+        case 0: return 1; /* PF_FLOATING_POINT_PRECISION_ERRATA */
+        case 1: return 1; /* PF_FLOATING_POINT_EMULATED */
+        case 2: return 1; /* PF_COMPARE_EXCHANGE_DOUBLE */
+        case 3: return 1; /* PF_MMX_INSTRUCTIONS_AVAILABLE */
+        case 6: return 1; /* PF_PAE_ENABLED */
+        case 10: return 1; /* PF_XMMI_INSTRUCTIONS_AVAILABLE */
+        case 12: return 1; /* PF_NX_ENABLED */
+        case 13: return 1; /* PF_SSE3_INSTRUCTIONS_AVAILABLE */
+        case 14: return 1; /* PF_COMPARE_EXCHANGE128 */
+        case 17: return 1; /* PF_XSAVE_ENABLED */
+        case 23: return 1; /* PF_FASTFAIL_AVAILABLE */
+        default: return 0;
+    }
+}
+
+static uint32_t k32_pass_pointer(win32_process_t *proc, uint32_t *args) {
+    (void)proc;
+    return args[0];
+}
+
+static uint32_t k32_CoCreateGuid(win32_process_t *proc, uint32_t *args) {
+    uint32_t guid_va = args[0];
+    if (guid_va) {
+        uint8_t dummy_guid[16] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00 };
+        guest_mem_write(&proc->mem, guid_va, dummy_guid, 16);
+    }
+    return 0; /* S_OK */
+}
+
+static uint32_t k32_ResolveDelayLoadedAPI(win32_process_t *proc, uint32_t *args) {
+    uint32_t iat_entry_va = args[4];
+    uint32_t vector = 0;
+    if (iat_entry_va && guest_mem_read(&proc->mem, iat_entry_va, &vector, 4) && vector != 0) {
+        return vector;
+    }
+    return 0;
+}
+
+static uint32_t k32_GetDpiForWindow(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 96; /* 96 DPI standard */
+}
+
 static uint32_t k32_lstrcmpiA(win32_process_t *proc, uint32_t *args) {
     const char *s1 = (const char *)guest_va_to_host(&proc->mem, args[0]);
     const char *s2 = (const char *)guest_va_to_host(&proc->mem, args[1]);
@@ -775,6 +844,104 @@ static uint32_t k32_LockResource(win32_process_t *proc, uint32_t *args) {
     return args[0];
 }
 
+static uint32_t k32_WindowsCreateStringReference(win32_process_t *proc, uint32_t *args) {
+    uint32_t src_str = args[0];
+    uint32_t out_hstr = args[3];
+    if (out_hstr) {
+        guest_mem_write(&proc->mem, out_hstr, &src_str, 4);
+    }
+    return 0; /* S_OK */
+}
+
+static uint32_t k32_WindowsDeleteString(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0; /* S_OK */
+}
+
+static uint32_t k32_RoGetActivationFactory(win32_process_t *proc, uint32_t *args) {
+    uint32_t out_factory = args[2];
+    if (out_factory) {
+        uint32_t null_ptr = 0;
+        guest_mem_write(&proc->mem, out_factory, &null_ptr, 4);
+    }
+    return 0x80004002; /* E_NOINTERFACE / REGDB_E_CLASSNOTREG */
+}
+
+static uint32_t k32_CoCreateInstance(win32_process_t *proc, uint32_t *args) {
+    uint32_t out_ppv = args[4];
+    if (out_ppv) {
+        uint32_t null_ptr = 0;
+        guest_mem_write(&proc->mem, out_ppv, &null_ptr, 4);
+    }
+    return 0x80004002; /* E_NOINTERFACE */
+}
+
+static uint32_t k32_GetCurrentThreadId(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t k32_GetCurrentProcessId(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1000;
+}
+
+static uint32_t k32_GetCurrentProcess(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0xFFFFFFFF;
+}
+
+static uint32_t k32_OpenProcessToken(win32_process_t *proc, uint32_t *args) {
+    uint32_t token_ptr = args[2];
+    if (token_ptr) {
+        uint32_t tok = 0x00010002;
+        guest_mem_write(&proc->mem, token_ptr, &tok, 4);
+    }
+    return 1;
+}
+
+static uint32_t k32_IsDebuggerPresent(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0;
+}
+
+static uint32_t k32_FormatMessageW(win32_process_t *proc, uint32_t *args) {
+    uint32_t dwFlags = args[0];
+    uint32_t lpBuffer = args[4];
+    uint32_t nSize = args[5];
+
+    static const uint16_t s_untitled[] = { 'U','n','t','i','t','l','e','d',0 };
+    uint32_t len = 8;
+
+    if (dwFlags & 0x0100) { /* FORMAT_MESSAGE_ALLOCATE_BUFFER */
+        uint32_t alloc_args[2] = { 0x0040, (len + 1) * 2 };
+        uint32_t ptr = k32_LocalAlloc(proc, alloc_args);
+        if (ptr && lpBuffer) {
+            guest_mem_write(&proc->mem, ptr, s_untitled, (len + 1) * 2);
+            guest_mem_write(&proc->mem, lpBuffer, &ptr, 4);
+            return len;
+        }
+    } else if (lpBuffer && nSize > len) {
+        guest_mem_write(&proc->mem, lpBuffer, s_untitled, (len + 1) * 2);
+        return len;
+    }
+    return len;
+}
+
+static uint32_t k32_GetDpiForMonitor(win32_process_t *proc, uint32_t *args) {
+    uint32_t dpiX_va = args[2];
+    uint32_t dpiY_va = args[3];
+    uint32_t dpi = 96;
+    if (dpiX_va) guest_mem_write(&proc->mem, dpiX_va, &dpi, 4);
+    if (dpiY_va) guest_mem_write(&proc->mem, dpiY_va, &dpi, 4);
+    return 0; /* S_OK */
+}
+
+static uint32_t k32_lstrcmpiW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0;
+}
+
 static uint32_t k32_dummy_zero(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
     return 0;
@@ -814,6 +981,7 @@ void kernel32_init(void) {
 
     win32_register_api("KERNEL32.DLL", "GetModuleHandleA", 0, k32_GetModuleHandleA, 1);
     win32_register_api("KERNEL32.DLL", "GetStartupInfoA", 0, k32_GetStartupInfoA, 1);
+    win32_register_api("KERNEL32.DLL", "GetStartupInfoW", 0, k32_GetStartupInfoA, 1);
     win32_register_api("KERNEL32.DLL", "GetCommandLineA", 0, k32_GetCommandLineA, 0);
     win32_register_api("KERNEL32.DLL", "GetCommandLineW", 0, k32_GetCommandLineW, 0);
     win32_register_api("KERNEL32.DLL", "MulDiv", 0, k32_MulDiv, 3);
@@ -825,10 +993,59 @@ void kernel32_init(void) {
     win32_register_api("KERNEL32.DLL", "GetPrivateProfileStringA", 0, k32_GetPrivateProfileStringA, 6);
     win32_register_api("KERNEL32.DLL", "WritePrivateProfileStringA", 0, k32_WritePrivateProfileStringA, 4);
 
+    win32_register_api("KERNEL32.DLL", "CoTaskMemAlloc", 0, k32_LocalAlloc, 1);
+    win32_register_api("KERNEL32.DLL", "CoTaskMemFree", 0, k32_LocalFree, 1);
     win32_register_api("KERNEL32.DLL", "LocalAlloc", 0, k32_LocalAlloc, 2);
     win32_register_api("KERNEL32.DLL", "LocalFree", 0, k32_LocalFree, 1);
     win32_register_api("KERNEL32.DLL", "LocalLock", 0, k32_LocalLock, 1);
     win32_register_api("KERNEL32.DLL", "LocalReAlloc", 0, k32_LocalReAlloc, 3);
+    win32_register_api("KERNEL32.DLL", "LocalSize", 0, k32_LocalSize, 1);
+    win32_register_api("KERNEL32.DLL", "IsProcessorFeaturePresent", 0, k32_IsProcessorFeaturePresent, 1);
+    win32_register_api("KERNEL32.DLL", "HeapSetInformation", 0, k32_dummy_zero, 4);
+    win32_register_api("KERNEL32.DLL", "CoInitializeEx", 0, k32_dummy_zero, 2);
+    win32_register_api("KERNEL32.DLL", "CoUninitialize", 0, k32_dummy_zero, 0);
+    win32_register_api("KERNEL32.DLL", "CoCreateGuid", 0, k32_CoCreateGuid, 1);
+    win32_register_api("KERNEL32.DLL", "CoCreateInstance", 0, k32_CoCreateInstance, 5);
+    win32_register_api("KERNEL32.DLL", "GetCurrentThreadId", 0, k32_GetCurrentThreadId, 0);
+    win32_register_api("KERNEL32.DLL", "GetCurrentProcessId", 0, k32_GetCurrentProcessId, 0);
+    win32_register_api("KERNEL32.DLL", "GetCurrentProcess", 0, k32_GetCurrentProcess, 0);
+    win32_register_api("KERNEL32.DLL", "OpenProcessToken", 0, k32_OpenProcessToken, 3);
+    win32_register_api("KERNEL32.DLL", "IsDebuggerPresent", 0, k32_IsDebuggerPresent, 0);
+    win32_register_api("KERNEL32.DLL", "EventRegister", 0, k32_dummy_zero, 4);
+    win32_register_api("KERNEL32.DLL", "EventUnregister", 0, k32_dummy_zero, 1);
+    win32_register_api("KERNEL32.DLL", "EventWrite", 0, k32_dummy_zero, 5);
+    win32_register_api("KERNEL32.DLL", "EncodePointer", 0, k32_pass_pointer, 1);
+    win32_register_api("KERNEL32.DLL", "DecodePointer", 0, k32_pass_pointer, 1);
+    win32_register_api("KERNEL32.DLL", "InitializeCriticalSectionAndSpinCount", 0, k32_dummy_sync, 2);
+    win32_register_api("KERNEL32.DLL", "InitializeCriticalSectionEx", 0, k32_dummy_sync, 3);
+    win32_register_api("KERNEL32.DLL", "AcquireSRWLockExclusive", 0, k32_dummy_sync, 1);
+    win32_register_api("KERNEL32.DLL", "ReleaseSRWLockExclusive", 0, k32_dummy_sync, 1);
+    win32_register_api("KERNEL32.DLL", "AcquireSRWLockShared", 0, k32_dummy_sync, 1);
+    win32_register_api("KERNEL32.DLL", "ReleaseSRWLockShared", 0, k32_dummy_sync, 1);
+    win32_register_api("KERNEL32.DLL", "CreateSemaphoreExW", 0, k32_dummy_zero, 6);
+    win32_register_api("KERNEL32.DLL", "ReleaseSemaphore", 0, k32_dummy_zero, 3);
+    win32_register_api("KERNEL32.DLL", "CreateMutexExW", 0, k32_dummy_zero, 4);
+    win32_register_api("KERNEL32.DLL", "ReleaseMutex", 0, k32_dummy_zero, 1);
+    win32_register_api("KERNEL32.DLL", "CreateEventExW", 0, k32_dummy_zero, 4);
+    win32_register_api("KERNEL32.DLL", "CreateEventW", 0, k32_dummy_zero, 4);
+    win32_register_api("KERNEL32.DLL", "SetEvent", 0, k32_dummy_zero, 1);
+    win32_register_api("KERNEL32.DLL", "ResetEvent", 0, k32_dummy_zero, 1);
+    win32_register_api("KERNEL32.DLL", "WaitForSingleObject", 0, k32_dummy_zero, 2);
+    win32_register_api("KERNEL32.DLL", "WaitForSingleObjectEx", 0, k32_dummy_zero, 3);
+    win32_register_api("KERNEL32.DLL", "GetModuleHandleExW", 0, k32_GetModuleHandleA, 3);
+    win32_register_api("KERNEL32.DLL", "GetModuleFileNameW", 0, k32_GetModuleFileNameA, 3);
+    win32_register_api("KERNEL32.DLL", "FindResourceExW", 0, k32_FindResourceW, 4);
+    win32_register_api("KERNEL32.DLL", "FormatMessageW", 0, k32_FormatMessageW, 7);
+    win32_register_api("KERNEL32.DLL", "GetDpiForMonitor", 0, k32_GetDpiForMonitor, 4);
+    win32_register_api("KERNEL32.DLL", "lstrcmpiW", 0, k32_lstrcmpiW, 2);
+    win32_register_api("KERNEL32.DLL", "ResolveDelayLoadedAPI", 0, k32_ResolveDelayLoadedAPI, 6);
+    win32_register_api("KERNEL32.DLL", "SetThreadDpiAwarenessContext", 0, k32_pass_pointer, 1);
+    win32_register_api("KERNEL32.DLL", "GetDpiForWindow", 0, k32_GetDpiForWindow, 1);
+    win32_register_api("KERNEL32.DLL", "SystemParametersInfoForDpi", 0, k32_dummy_zero, 5);
+    win32_register_api("KERNEL32.DLL", "WindowsCreateStringReference", 0, k32_WindowsCreateStringReference, 4);
+    win32_register_api("KERNEL32.DLL", "WindowsDeleteString", 0, k32_WindowsDeleteString, 1);
+    win32_register_api("KERNEL32.DLL", "RoGetActivationFactory", 0, k32_RoGetActivationFactory, 3);
+    win32_register_api("KERNEL32.DLL", "RegisterApplicationRestart", 0, k32_dummy_zero, 2);
 
     win32_register_api("KERNEL32.DLL", "_lopen", 0, k32_lopen, 2);
     win32_register_api("KERNEL32.DLL", "_lcreat", 0, k32_lcreat, 2);

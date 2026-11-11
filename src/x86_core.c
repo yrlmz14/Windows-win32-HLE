@@ -720,6 +720,40 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
         return true;
     }
 
+    /* PUSHFD (0x9C) */
+    if (op == 0x9C) {
+        ctx->regs.esp -= 4;
+        x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.eflags);
+        ctx->regs.eip += 1;
+        return true;
+    }
+
+    /* POPFD (0x9D) */
+    if (op == 0x9D) {
+        uint32_t val = 0;
+        x86_mem_read32(ctx, ctx->regs.esp, &val);
+        ctx->regs.esp += 4;
+        ctx->regs.eflags = (val & 0x003F7FD5U) | 0x02;
+        ctx->regs.eip += 1;
+        return true;
+    }
+
+    /* SAHF (0x9E) */
+    if (op == 0x9E) {
+        uint8_t ah = (ctx->regs.eax >> 8) & 0xFF;
+        ctx->regs.eflags = (ctx->regs.eflags & ~0xD5U) | (ah & 0xD5) | 0x02;
+        ctx->regs.eip += 1;
+        return true;
+    }
+
+    /* LAHF (0x9F) */
+    if (op == 0x9F) {
+        uint32_t low_flags = (ctx->regs.eflags & 0xD5) | 0x02;
+        ctx->regs.eax = (ctx->regs.eax & ~0xFF00U) | (low_flags << 8);
+        ctx->regs.eip += 1;
+        return true;
+    }
+
     /* ADD EAX, imm32 (0x05) */
     if (op == 0x05) {
         uint32_t imm = (uint32_t)code[1] | ((uint32_t)code[2] << 8) |
@@ -864,6 +898,34 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
         x86_mem_read32(ctx, ctx->regs.esp, &val);
         ctx->regs.esp += 4;
         gprs[r] = val;
+        ctx->regs.eip += 1;
+        return true;
+    }
+
+    /* PUSHAD (0x60) */
+    if (op == 0x60) {
+        uint32_t old_esp = gprs[4];
+        uint8_t order[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+        for (int k = 0; k < 8; k++) {
+            uint32_t val = (order[k] == 4) ? old_esp : gprs[order[k]];
+            ctx->regs.esp -= 4;
+            x86_mem_write32(ctx, ctx->regs.esp, val);
+        }
+        ctx->regs.eip += 1;
+        return true;
+    }
+
+    /* POPAD (0x61) */
+    if (op == 0x61) {
+        uint8_t order[8] = { 7, 6, 5, 4, 3, 2, 1, 0 };
+        for (int k = 0; k < 8; k++) {
+            uint32_t val = 0;
+            x86_mem_read32(ctx, ctx->regs.esp, &val);
+            ctx->regs.esp += 4;
+            if (order[k] != 4) {
+                gprs[order[k]] = val;
+            }
+        }
         ctx->regs.eip += 1;
         return true;
     }
@@ -1923,6 +1985,76 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
             return true;
         }
 
+        /* MOV r/m16, Sreg (0x66 0x8C) */
+        if (op2 == 0x8C) {
+            modrm_t m;
+            decode_modrm(code + 2, &m);
+            static const uint16_t s_segs[8] = { 0x23, 0x1B, 0x23, 0x23, 0x3B, 0x23, 0x23, 0x23 };
+            uint16_t val = s_segs[m.reg & 7];
+            if (m.mod == 3) {
+                gprs[m.rm] = (gprs[m.rm] & ~0xFFFFU) | val;
+            } else {
+                uint32_t addr = modrm_effective_addr(&m, gprs);
+                x86_mem_write16(ctx, addr, val);
+            }
+            ctx->regs.eip += 2 + m.len;
+            return true;
+        }
+
+        /* MOV Sreg, r/m16 (0x66 0x8E) */
+        if (op2 == 0x8E) {
+            modrm_t m;
+            decode_modrm(code + 2, &m);
+            ctx->regs.eip += 2 + m.len;
+            return true;
+        }
+
+        /* PUSHA (0x66 0x60) */
+        if (op2 == 0x60) {
+            uint16_t old_sp = (uint16_t)gprs[4];
+            uint8_t order[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+            for (int k = 0; k < 8; k++) {
+                uint16_t val = (order[k] == 4) ? old_sp : (uint16_t)gprs[order[k]];
+                ctx->regs.esp -= 2;
+                x86_mem_write16(ctx, ctx->regs.esp, val);
+            }
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* POPA (0x66 0x61) */
+        if (op2 == 0x61) {
+            uint8_t order[8] = { 7, 6, 5, 4, 3, 2, 1, 0 };
+            for (int k = 0; k < 8; k++) {
+                uint16_t val = 0;
+                x86_mem_read16(ctx, ctx->regs.esp, &val);
+                ctx->regs.esp += 2;
+                if (order[k] != 4) {
+                    gprs[order[k]] = (gprs[order[k]] & ~0xFFFFU) | val;
+                }
+            }
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* PUSHF (0x66 0x9C) */
+        if (op2 == 0x9C) {
+            ctx->regs.esp -= 2;
+            x86_mem_write16(ctx, ctx->regs.esp, (uint16_t)ctx->regs.eflags);
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* POPF (0x66 0x9D) */
+        if (op2 == 0x9D) {
+            uint16_t val = 0;
+            x86_mem_read16(ctx, ctx->regs.esp, &val);
+            ctx->regs.esp += 2;
+            ctx->regs.eflags = (ctx->regs.eflags & ~0xFFFFU) | (val & 0x7FD5U) | 0x02;
+            ctx->regs.eip += 2;
+            return true;
+        }
+
         fprintf(stderr, "[0x66 Prefix] Unhandled sub-opcode 0x%02X at EIP=0x%08X (bytes: %02X %02X %02X %02X %02X)\n",
                 op2, (unsigned int)ctx->regs.eip, code[0], code[1], code[2], code[3], code[4]);
     }
@@ -2315,6 +2447,47 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
         decode_modrm(code + 1, &m);
         gprs[m.reg] = modrm_effective_addr(&m, gprs);
         ctx->regs.eip += 1 + m.len;
+        return true;
+    }
+
+    /* MOV r/m16/32, Sreg (0x8C) */
+    if (op == 0x8C) {
+        modrm_t m;
+        decode_modrm(code + 1, &m);
+        static const uint16_t s_segs[8] = { 0x23, 0x1B, 0x23, 0x23, 0x3B, 0x23, 0x23, 0x23 };
+        uint16_t val = s_segs[m.reg & 7];
+        if (m.mod == 3) {
+            gprs[m.rm] = val;
+        } else {
+            uint32_t addr = modrm_effective_addr(&m, gprs);
+            x86_mem_write16(ctx, addr, val);
+        }
+        ctx->regs.eip += 1 + m.len;
+        return true;
+    }
+
+    /* MOV Sreg, r/m16 (0x8E) */
+    if (op == 0x8E) {
+        modrm_t m;
+        decode_modrm(code + 1, &m);
+        ctx->regs.eip += 1 + m.len;
+        return true;
+    }
+
+    /* INT 3 (0xCC) */
+    if (op == 0xCC) {
+        ctx->regs.eip += 1;
+        return true;
+    }
+
+    /* INT imm8 (0xCD) */
+    if (op == 0xCD) {
+        uint8_t int_num = code[1];
+        if (int_num == 0x29) {
+            fprintf(stderr, "[CPU] __fastfail invoked! Code=0x%08X (ECX=0x%08X)\n",
+                    (unsigned int)ctx->regs.ecx, (unsigned int)ctx->regs.ecx);
+        }
+        ctx->regs.eip += 2;
         return true;
     }
 
