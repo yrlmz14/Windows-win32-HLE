@@ -33,22 +33,6 @@ int eink_init(int w, int h) {
     s_eink.is_sim = true;
     s_sim_pixels = (uint32_t *)malloc(s_eink.width * s_eink.height * sizeof(uint32_t));
 
-    WNDCLASSA wc = {0};
-    wc.style = CS_DBLCLKS;
-    wc.lpfnWndProc = SimWndProc;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = "KindleWin32Sim";
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClassA(&wc);
-
-    int win_w = s_eink.width;
-    int win_h = s_eink.height;
-
-    s_sim_hwnd = CreateWindowExA(0, "KindleWin32Sim", "Win32 HLE Runner (MinGW)",
-                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                 100, 50, win_w, win_h, NULL, NULL, GetModuleHandle(NULL), NULL);
-    s_sim_hdc = GetDC(s_sim_hwnd);
-
     memset(&s_bmi, 0, sizeof(s_bmi));
     s_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     s_bmi.bmiHeader.biWidth = s_eink.width;
@@ -56,6 +40,24 @@ int eink_init(int w, int h) {
     s_bmi.bmiHeader.biPlanes = 1;
     s_bmi.bmiHeader.biBitCount = 32;
     s_bmi.bmiHeader.biCompression = BI_RGB;
+
+    if (!getenv("HEADLESS_SIM")) {
+        WNDCLASSA wc = {0};
+        wc.style = CS_DBLCLKS;
+        wc.lpfnWndProc = SimWndProc;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.lpszClassName = "KindleWin32Sim";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        RegisterClassA(&wc);
+
+        int win_w = s_eink.width;
+        int win_h = s_eink.height;
+
+        s_sim_hwnd = CreateWindowExA(0, "KindleWin32Sim", "Win32 HLE Runner (MinGW)",
+                                     WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                     100, 50, win_w, win_h, NULL, NULL, GetModuleHandle(NULL), NULL);
+        s_sim_hdc = GetDC(s_sim_hwnd);
+    }
 #else
     s_eink.fbfd = open("/dev/fb0", O_RDWR);
     if (s_eink.fbfd >= 0) {
@@ -260,6 +262,45 @@ void eink_present(int mode) {
     if (!s_eink.canvas) return;
 
 #ifdef _WIN32
+    const char *dump_path = getenv("DUMP_BMP");
+    if (dump_path && dump_path[0]) {
+        bool has_content = false;
+        for (int i = 0; i < s_eink.width * s_eink.height; i++) {
+            if (s_eink.canvas[i] != EINK_WHITE) { has_content = true; break; }
+        }
+        if (has_content) {
+            char tmp_path[512];
+            snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dump_path);
+            FILE *f = fopen(tmp_path, "wb");
+            if (f) {
+                int w = s_eink.width;
+                int h = s_eink.height;
+                uint32_t row_bytes = (uint32_t)w * 3;
+                uint32_t img_size = row_bytes * (uint32_t)h;
+                uint8_t bmp_hdr[54] = {0};
+                bmp_hdr[0] = 'B'; bmp_hdr[1] = 'M';
+                *(uint32_t *)(bmp_hdr + 2) = 54 + img_size;
+                *(uint32_t *)(bmp_hdr + 10) = 54;
+                *(uint32_t *)(bmp_hdr + 14) = 40;
+                *(int32_t *)(bmp_hdr + 18) = w;
+                *(int32_t *)(bmp_hdr + 22) = -h;
+                *(uint16_t *)(bmp_hdr + 26) = 1;
+                *(uint16_t *)(bmp_hdr + 28) = 24;
+                *(uint32_t *)(bmp_hdr + 34) = img_size;
+                fwrite(bmp_hdr, 1, 54, f);
+                for (int y = 0; y < h; y++) {
+                    for (int x = 0; x < w; x++) {
+                        uint8_t g = s_eink.canvas[y * s_eink.stride + x];
+                        uint8_t px[3] = { g, g, g };
+                        fwrite(px, 1, 3, f);
+                    }
+                }
+                fclose(f);
+                remove(dump_path);
+                rename(tmp_path, dump_path);
+            }
+        }
+    }
     if (s_sim_pixels && s_sim_hdc) {
         for (int i = 0; i < s_eink.width * s_eink.height; i++) {
             uint8_t g = s_eink.canvas[i];

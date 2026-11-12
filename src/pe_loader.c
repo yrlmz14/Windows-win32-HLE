@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #define PAGE_SIZE 4096U
 #define PAGE_MASK 0xFFFU
@@ -352,6 +353,92 @@ bool pe_load_buffer(win32_process_t *proc, const uint8_t *buf, size_t buf_size) 
     return true;
 }
 
+static bool pe_load_mui_buffer(win32_process_t *proc, const uint8_t *buf, size_t buf_size) {
+    if (!proc || !buf || buf_size < sizeof(pe_dos_header_t)) return false;
+    const pe_dos_header_t *dos = (const pe_dos_header_t *)buf;
+    if (dos->e_magic != 0x5A4D) return false;
+    if (dos->e_lfanew + sizeof(uint32_t) + sizeof(pe_file_header_t) + sizeof(pe_optional_header32_t) > buf_size) return false;
+    const uint8_t *nt_ptr = buf + dos->e_lfanew;
+    if (*(const uint32_t *)nt_ptr != 0x00004550) return false;
+    const pe_file_header_t *file_hdr = (const pe_file_header_t *)(nt_ptr + 4);
+    const pe_optional_header32_t *opt = (const pe_optional_header32_t *)((const uint8_t *)file_hdr + sizeof(pe_file_header_t));
+    if (opt->Magic != 0x10B) return false;
+
+    uint32_t rsrc_rva = (opt->NumberOfRvaAndSizes > 2) ? opt->DataDirectory[2].VirtualAddress : 0;
+    uint32_t rsrc_size = (opt->NumberOfRvaAndSizes > 2) ? opt->DataDirectory[2].Size : 0;
+    if (!rsrc_rva || !rsrc_size) return false;
+
+    proc->mui_base = 0x20000000U;
+    proc->mui_rsrc_rva = rsrc_rva;
+    proc->mui_rsrc_size = rsrc_size;
+
+    size_t hdr_copy = opt->SizeOfHeaders < buf_size ? opt->SizeOfHeaders : buf_size;
+    guest_mem_commit(&proc->mem, proc->mui_base, hdr_copy);
+    guest_mem_write(&proc->mem, proc->mui_base, buf, hdr_copy);
+
+    const pe_section_header_t *sec = (const pe_section_header_t *)((const uint8_t *)opt + file_hdr->SizeOfOptionalHeader);
+    for (int i = 0; i < file_hdr->NumberOfSections; i++) {
+        uint32_t sec_va = proc->mui_base + sec[i].VirtualAddress;
+        uint32_t sec_vsize = sec[i].VirtualSize ? sec[i].VirtualSize : sec[i].SizeOfRawData;
+        guest_mem_commit(&proc->mem, sec_va, sec_vsize);
+        if (sec[i].PointerToRawData < buf_size && sec[i].SizeOfRawData > 0) {
+            size_t copy_len = sec[i].SizeOfRawData;
+            if (sec[i].PointerToRawData + copy_len > buf_size) {
+                copy_len = buf_size - sec[i].PointerToRawData;
+            }
+            guest_mem_write(&proc->mem, sec_va, buf + sec[i].PointerToRawData, copy_len);
+        }
+    }
+    LOGI("Mapped companion MUI resource module at 0x%08X (rsrc_rva=0x%X, size=%u)", proc->mui_base, proc->mui_rsrc_rva, proc->mui_rsrc_size);
+    return true;
+}
+
+static void pe_try_load_companion_mui(win32_process_t *proc, const char *filepath) {
+    if (!proc || !filepath) return;
+    char dir[256] = {0};
+    const char *base = filepath;
+    const char *last_slash = strrchr(filepath, '/');
+    const char *last_bslash = strrchr(filepath, '\\');
+    const char *sep = last_slash > last_bslash ? last_slash : last_bslash;
+    if (sep) {
+        size_t dlen = (size_t)(sep - filepath);
+        if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
+        memcpy(dir, filepath, dlen);
+        dir[dlen] = '\0';
+        base = sep + 1;
+    } else {
+        strcpy(dir, ".");
+    }
+
+    char candidates[4][320];
+    snprintf(candidates[0], sizeof(candidates[0]), "%s/en-US/%s.mui", dir, base);
+    snprintf(candidates[1], sizeof(candidates[1]), "%s/tr-TR/%s.mui", dir, base);
+    snprintf(candidates[2], sizeof(candidates[2]), "%s/%s.mui", dir, base);
+    snprintf(candidates[3], sizeof(candidates[3]), "%s/tr-TR/notepad.exe.mui", dir);
+
+    for (int i = 0; i < 4; i++) {
+        FILE *mf = fopen(candidates[i], "rb");
+        if (!mf) continue;
+        fseek(mf, 0, SEEK_END);
+        long msz = ftell(mf);
+        fseek(mf, 0, SEEK_SET);
+        if (msz > 0 && msz < 16 * 1024 * 1024) {
+            uint8_t *mbuf = (uint8_t *)malloc(msz);
+            if (mbuf) {
+                if (fread(mbuf, 1, msz, mf) == (size_t)msz) {
+                    if (pe_load_mui_buffer(proc, mbuf, (size_t)msz)) {
+                        free(mbuf);
+                        fclose(mf);
+                        return;
+                    }
+                }
+                free(mbuf);
+            }
+        }
+        fclose(mf);
+    }
+}
+
 bool pe_load_file(win32_process_t *proc, const char *filepath) {
     if (!proc || !filepath) return false;
     FILE *f = fopen(filepath, "rb");
@@ -388,12 +475,38 @@ bool pe_load_file(win32_process_t *proc, const char *filepath) {
     strncpy(proc->exe_path, filepath, sizeof(proc->exe_path) - 1);
     bool ok = pe_load_buffer(proc, buf, sz);
     free(buf);
+    if (ok) {
+        pe_try_load_companion_mui(proc, filepath);
+    }
     return ok;
 }
 
-uint32_t pe_find_resource_data(const win32_process_t *proc, uint32_t type_id, uint32_t name_id, uint32_t *out_size) {
-    if (!proc || !proc->rsrc_rva) return 0;
-    uint32_t rsrc_base_va = proc->image_base + proc->rsrc_rva;
+static uint32_t find_resource_in_module(const win32_process_t *proc, uint32_t mod_base, uint32_t mod_rsrc_rva,
+                                        uint32_t type_id, uint32_t name_or_id, bool is_unicode, uint32_t *out_size) {
+    if (!proc || !mod_base || !mod_rsrc_rva) return 0;
+    uint32_t rsrc_base_va = mod_base + mod_rsrc_rva;
+
+    char target_name[128] = {0};
+    bool is_id = ((name_or_id >> 16) == 0);
+    uint32_t resolved_id = name_or_id;
+
+    if (!is_id) {
+        for (int k = 0; k < 127; k++) {
+            uint16_t ch = 0;
+            if (is_unicode) {
+                if (!guest_mem_read(&proc->mem, name_or_id + k * 2, &ch, 2) || ch == 0) break;
+            } else {
+                uint8_t b = 0;
+                if (!guest_mem_read(&proc->mem, name_or_id + k, &b, 1) || b == 0) break;
+                ch = b;
+            }
+            target_name[k] = (ch < 128) ? (char)toupper((unsigned char)ch) : '?';
+        }
+        if (target_name[0] == '#') {
+            resolved_id = (uint32_t)atoi(target_name + 1);
+            is_id = true;
+        }
+    }
 
     /* Level 1: Find type_id */
     uint16_t num_named = 0, num_id = 0;
@@ -413,7 +526,7 @@ uint32_t pe_find_resource_data(const win32_process_t *proc, uint32_t type_id, ui
     }
     if (!type_sub_off) return 0;
 
-    /* Level 2: Find name_id */
+    /* Level 2: Find name_or_id */
     uint32_t name_dir_va = rsrc_base_va + type_sub_off;
     if (!guest_mem_read(&proc->mem, name_dir_va + 12, &num_named, 2)) return 0;
     if (!guest_mem_read(&proc->mem, name_dir_va + 14, &num_id, 2)) return 0;
@@ -424,10 +537,35 @@ uint32_t pe_find_resource_data(const win32_process_t *proc, uint32_t type_id, ui
         uint32_t eid = 0, eoff = 0;
         guest_mem_read(&proc->mem, name_dir_va + 16 + i * 8, &eid, 4);
         guest_mem_read(&proc->mem, name_dir_va + 20 + i * 8, &eoff, 4);
-        if (eid == name_id && (eoff & 0x80000000U)) {
-            name_sub_off = eoff & 0x7FFFFFFFU;
-            break;
+        if (!(eoff & 0x80000000U)) continue;
+
+        if (is_id) {
+            if (!(eid & 0x80000000U) && eid == resolved_id) {
+                name_sub_off = eoff & 0x7FFFFFFFU;
+                break;
+            }
+        } else if (eid & 0x80000000U) {
+            uint32_t str_va = rsrc_base_va + (eid & 0x7FFFFFFFU);
+            uint16_t slen = 0;
+            if (guest_mem_read(&proc->mem, str_va, &slen, 2) && slen > 0 && slen < 127) {
+                char entry_name[128] = {0};
+                for (int k = 0; k < slen; k++) {
+                    uint16_t wch = 0;
+                    guest_mem_read(&proc->mem, str_va + 2 + k * 2, &wch, 2);
+                    entry_name[k] = (wch < 128) ? (char)toupper((unsigned char)wch) : '?';
+                }
+                if (strcmp(entry_name, target_name) == 0) {
+                    name_sub_off = eoff & 0x7FFFFFFFU;
+                    break;
+                }
+            }
         }
+    }
+    /* Fallback: if app passes ID 0 or name isn't matched when only 1 resource of this type exists */
+    if (!name_sub_off && is_id && resolved_id == 0 && total > 0) {
+        uint32_t eoff = 0;
+        guest_mem_read(&proc->mem, name_dir_va + 20, &eoff, 4);
+        if (eoff & 0x80000000U) name_sub_off = eoff & 0x7FFFFFFFU;
     }
     if (!name_sub_off) return 0;
 
@@ -444,13 +582,27 @@ uint32_t pe_find_resource_data(const win32_process_t *proc, uint32_t type_id, ui
     guest_mem_read(&proc->mem, leaf_va + 4, &data_size, 4);
 
     if (out_size) *out_size = data_size;
-    return proc->image_base + data_rva;
+    return mod_base + data_rva;
 }
 
-int pe_load_resource_string(const win32_process_t *proc, uint32_t string_id, uint16_t *out_str, int max_chars) {
-    if (!proc || !proc->rsrc_rva || !out_str || max_chars <= 0) return 0;
+uint32_t pe_find_resource_ex(const win32_process_t *proc, uint32_t type_id, uint32_t name_or_id, bool is_unicode, uint32_t *out_size) {
+    if (!proc) return 0;
+    uint32_t va = find_resource_in_module(proc, proc->image_base, proc->rsrc_rva, type_id, name_or_id, is_unicode, out_size);
+    if (!va && proc->mui_rsrc_rva) {
+        va = find_resource_in_module(proc, proc->mui_base, proc->mui_rsrc_rva, type_id, name_or_id, is_unicode, out_size);
+    }
+    return va;
+}
 
-    uint32_t rsrc_base_va = proc->image_base + proc->rsrc_rva;
+uint32_t pe_find_resource_data(const win32_process_t *proc, uint32_t type_id, uint32_t name_id, uint32_t *out_size) {
+    return pe_find_resource_ex(proc, type_id, name_id, false, out_size);
+}
+
+static int load_string_from_module(const win32_process_t *proc, uint32_t mod_base, uint32_t mod_rsrc_rva,
+                                   uint32_t string_id, uint16_t *out_str, int max_chars) {
+    if (!proc || !mod_base || !mod_rsrc_rva || !out_str || max_chars <= 0) return 0;
+
+    uint32_t rsrc_base_va = mod_base + mod_rsrc_rva;
     uint32_t target_block = (string_id >> 4) + 1;
     uint32_t str_index = string_id & 0x0F;
 
@@ -502,7 +654,7 @@ int pe_load_resource_string(const win32_process_t *proc, uint32_t string_id, uin
     guest_mem_read(&proc->mem, data_leaf_va, &data_rva, 4);
     guest_mem_read(&proc->mem, data_leaf_va + 4, &data_size, 4);
 
-    uint32_t cur_va = proc->image_base + data_rva;
+    uint32_t cur_va = mod_base + data_rva;
     for (uint32_t idx = 0; idx < 16; idx++) {
         uint16_t len = 0;
         if (!guest_mem_read(&proc->mem, cur_va, &len, 2)) return 0;
@@ -519,6 +671,15 @@ int pe_load_resource_string(const win32_process_t *proc, uint32_t string_id, uin
     }
 
     return 0;
+}
+
+int pe_load_resource_string(const win32_process_t *proc, uint32_t string_id, uint16_t *out_str, int max_chars) {
+    if (!proc || !out_str || max_chars <= 0) return 0;
+    int len = load_string_from_module(proc, proc->image_base, proc->rsrc_rva, string_id, out_str, max_chars);
+    if (len == 0 && proc->mui_rsrc_rva) {
+        len = load_string_from_module(proc, proc->mui_base, proc->mui_rsrc_rva, string_id, out_str, max_chars);
+    }
+    return len;
 }
 
 #pragma pack(push, 1)

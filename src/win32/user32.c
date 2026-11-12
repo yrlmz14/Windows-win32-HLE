@@ -1,10 +1,13 @@
 #include "user32.h"
 #include "gdi32.h"
+#include "kernel32.h"
 #include "win32_dispatch.h"
 #include "../platform/kindle_touch.h"
 #include "../platform/eink_render.h"
 #include "../platform/vkeyboard.h"
 #include <strings.h>
+#include <stdlib.h>
+#include <string.h>
 
 void win32_register_api(const char *dll, const char *name, uint16_t ordinal, hle_api_fn handler, uint8_t arg_count);
 
@@ -20,15 +23,80 @@ static H_HWND         s_active_hwnd = 0;
 static H_HWND         s_capture_hwnd = 0;
 static WIN_POINT      s_cursor_pos = {100, 100};
 
+static H_HWND         s_open_menu_hwnd = 0;
+static int            s_open_menu_idx  = -1;
+
 void user32_init_apis(void);
+static LRESULT builtin_wndproc_dispatch(win32_process_t *proc, win32_window_t *w, GUEST_PTR wndproc, UINT msg, WPARAM wParam, LPARAM lParam);
+static uint32_t load_menu_internal(win32_process_t *proc, uint32_t menu_id_or_name, bool is_unicode);
+
+static void register_builtin_class(const char *name, GUEST_PTR wndproc, H_HBRUSH brush) {
+    if (s_class_count >= MAX_CLASSES) return;
+    strncpy(s_classes[s_class_count].class_name, name, sizeof(s_classes[0].class_name) - 1);
+    s_classes[s_class_count].wndproc = wndproc;
+    s_classes[s_class_count].background_brush = brush;
+    s_class_count++;
+}
+
+static H_HDC s_desktop_hdc = 0;
+static H_HBRUSH s_sys_brushes[32] = {0};
+
+#define MAX_ICONS 64
+
+typedef struct {
+    bool in_use;
+    int width;
+    int height;
+    uint32_t pixels[32 * 32]; /* 32x32 ARGB */
+} win32_icon_entry_t;
+
+static win32_icon_entry_t s_icons[MAX_ICONS];
+
+#define MAX_MENUS 64
+#define MAX_MENU_ITEMS 24
+
+typedef struct {
+    char title[48];
+    uint32_t id;
+    uint32_t flags;
+    H_HMENU hsub;
+} win32_menu_item_t;
+
+typedef struct {
+    bool in_use;
+    H_HMENU hmenu;
+    int item_count;
+    win32_menu_item_t items[MAX_MENU_ITEMS];
+} win32_menu_t;
+
+static win32_menu_t s_menus[MAX_MENUS];
 
 void user32_init(void) {
     memset(s_classes, 0, sizeof(s_classes));
     s_class_count = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (s_windows[i].framebuffer) free(s_windows[i].framebuffer);
+        if (s_windows[i].edit_buf) free(s_windows[i].edit_buf);
+    }
     memset(s_windows, 0, sizeof(s_windows));
+    memset(s_icons, 0, sizeof(s_icons));
+    memset(s_menus, 0, sizeof(s_menus));
+    memset(s_sys_brushes, 0, sizeof(s_sys_brushes));
+    s_desktop_hdc = 0;
     s_msg_head = s_msg_tail = 0;
     s_active_hwnd = 0;
     s_capture_hwnd = 0;
+    s_open_menu_hwnd = 0;
+    s_open_menu_idx = -1;
+
+    register_builtin_class("Button", BUILTIN_WNDPROC_BUTTON, 16);
+    register_builtin_class("Edit", BUILTIN_WNDPROC_EDIT, 6);
+    register_builtin_class("Static", BUILTIN_WNDPROC_STATIC, 16);
+    register_builtin_class("ListBox", BUILTIN_WNDPROC_LISTBOX, 6);
+    register_builtin_class("ComboBox", BUILTIN_WNDPROC_COMBOBOX, 6);
+    register_builtin_class("msctls_statusbar32", BUILTIN_WNDPROC_STATUSBAR, 16);
+    register_builtin_class("ScrollBar", BUILTIN_WNDPROC_SCROLLBAR, 16);
+
     user32_init_apis();
 }
 
@@ -110,12 +178,18 @@ bool user_post_message(H_HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return true;
 }
 
-/* Call Window Procedure in guest x86 space */
+/* Call Window Procedure in guest x86 space or built-in HLE class handler */
 static LRESULT call_wndproc(win32_process_t *proc, GUEST_PTR wndproc, H_HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    win32_window_t *w = user_get_window(hwnd);
+    if (wndproc >= 0xFE010000U && wndproc <= 0xFE0100FFU) {
+        return builtin_wndproc_dispatch(proc, w, wndproc, msg, wParam, lParam);
+    }
     if (!proc || !wndproc) return 0;
 
-    LOGI("call_wndproc: HWND 0x%08X, msg 0x%04X (wP=0x%08X, lP=0x%08X), wndproc=0x%08X",
-         hwnd, msg, (uint32_t)wParam, (uint32_t)lParam, wndproc);
+    if (msg != 0 && msg != WM_PAINT && msg != 0x0014 && msg != 0x0085 && msg != 0x0200) {
+        LOGI("call_wndproc: HWND 0x%08X, msg 0x%04X (wP=0x%08X, lP=0x%08X), wndproc=0x%08X",
+             hwnd, msg, (uint32_t)wParam, (uint32_t)lParam, wndproc);
+    }
 
     /* Push arguments for __stdcall WndProc(HWND, UINT, WPARAM, LPARAM) */
     uint32_t saved_esp = proc->cpu.regs.esp;
@@ -148,7 +222,7 @@ static LRESULT call_wndproc(win32_process_t *proc, GUEST_PTR wndproc, H_HWND hwn
     LRESULT result = (LRESULT)proc->cpu.regs.eax;
     if (steps >= 20000000) {
         LOGW("call_wndproc: execution step limit (20,000,000 steps) reached for msg 0x%04X", msg);
-    } else {
+    } else if (msg != 0 && msg != WM_PAINT && msg != 0x0014 && msg != 0x0085 && msg != 0x0200) {
         LOGI("call_wndproc: msg 0x%04X done in %d steps, ret=0x%08X", msg, steps, (uint32_t)result);
     }
     proc->cpu.regs.esp = saved_esp;
@@ -177,8 +251,13 @@ static uint32_t u32_RegisterClassA(win32_process_t *proc, uint32_t *args) {
     s_classes[s_class_count].icon = wc->hIcon;
     s_classes[s_class_count].cursor = wc->hCursor;
     s_classes[s_class_count].background_brush = wc->hbrBackground;
+    s_classes[s_class_count].menu_id = wc->lpszMenuName;
+    if ((wc->lpszMenuName >> 16) != 0) {
+        const char *mname = (const char *)guest_va_to_host(&proc->mem, wc->lpszMenuName);
+        if (mname) strncpy(s_classes[s_class_count].menu_name, mname, sizeof(s_classes[0].menu_name) - 1);
+    }
 
-    LOGI("RegisterClassA: %s (WndProc=0x%08X)", name, wc->lpfnWndProc);
+    LOGI("RegisterClassA: %s (WndProc=0x%08X, menu=0x%X)", name, wc->lpfnWndProc, wc->lpszMenuName);
     s_class_count++;
     return 0x0001; /* Atom */
 }
@@ -264,17 +343,6 @@ static void draw_button_argb(uint8_t *fb, int stride, int fb_w, int fb_h, int x,
         }
     }
 }
-#define MAX_ICONS 64
-
-typedef struct {
-    bool in_use;
-    int width;
-    int height;
-    uint32_t pixels[32 * 32]; /* 32x32 ARGB */
-} win32_icon_entry_t;
-
-static win32_icon_entry_t s_icons[MAX_ICONS];
-
 H_HICON user_extract_icon(const char *exe_path, int icon_index) {
     if (!exe_path) return 0;
 
@@ -307,25 +375,6 @@ H_HICON user_extract_icon(const char *exe_path, int icon_index) {
     LOGI("user_extract_icon: Loaded icon for %s -> HICON 0x%04X", exe_path, slot);
     return (H_HICON)slot;
 }
-
-#define MAX_MENUS 32
-#define MAX_MENU_ITEMS 16
-
-typedef struct {
-    char title[32];
-    uint32_t id;
-    uint32_t flags;
-    H_HMENU hsub;
-} win32_menu_item_t;
-
-typedef struct {
-    bool in_use;
-    H_HMENU hmenu;
-    int item_count;
-    win32_menu_item_t items[MAX_MENU_ITEMS];
-} win32_menu_t;
-
-static win32_menu_t s_menus[MAX_MENUS];
 
 static uint8_t *allocate_window_framebuffer(int w, int h, uint32_t bg_color) {
     if (w <= 0 || h <= 0) return NULL;
@@ -362,6 +411,8 @@ static void update_window_client_area(win32_window_t *w) {
                 bm->bitmap.height = w->client_h;
                 bm->bitmap.stride = w->fb_stride;
                 bm->bitmap.bits = w->framebuffer + (w->client_y * w->fb_stride) + (w->client_x * 4);
+                bm->bitmap.is_dib = true;
+                bm->bitmap.is_window_fb = true; /* Prevent DeleteObject/gdi32_init from freeing window->framebuffer */
             }
         }
     }
@@ -483,10 +534,13 @@ static uint32_t u32_CreateWindowExA(win32_process_t *proc, uint32_t *args) {
     if (class_name) strncpy(win->class_name, class_name, sizeof(win->class_name) - 1);
     if (title) strncpy(win->title, title, sizeof(win->title) - 1);
 
-    /* Lookup class wndproc */
+    /* Lookup class wndproc and default menu */
     for (int i = 0; i < s_class_count; i++) {
         if (strcasecmp(s_classes[i].class_name, win->class_name) == 0) {
             win->wndproc = s_classes[i].wndproc;
+            if (!(style & WS_CHILD) && win->menu == 0 && s_classes[i].menu_id != 0) {
+                win->menu = (H_HMENU)load_menu_internal(proc, s_classes[i].menu_id, false);
+            }
             break;
         }
     }
@@ -521,18 +575,18 @@ static uint32_t u32_CreateWindowExA(win32_process_t *proc, uint32_t *args) {
     update_window_client_area(win);
     paint_window_decorations(win);
 
-    s_active_hwnd = hwnd;
+    s_active_hwnd = (style & WS_CHILD) ? (s_active_hwnd ? s_active_hwnd : parent) : hwnd;
     LOGI("CreateWindowExA: '%s' (%s) -> HWND 0x%08X [%d,%d %dx%d]",
          win->title, win->class_name, hwnd, x, y, w, h);
 
-    /* Send WM_CREATE */
+    /* Send WM_CREATE and WM_SIZE */
     user_send_message(proc, hwnd, WM_CREATE, 0, 0, NULL);
+    user_send_message(proc, hwnd, WM_SIZE, 0, ((uint32_t)win->client_h << 16) | (win->client_w & 0xFFFF), NULL);
 
     return (uint32_t)hwnd;
 }
 
 static uint32_t u32_ShowWindow(win32_process_t *proc, uint32_t *args) {
-    (void)proc;
     H_HWND hwnd = (H_HWND)args[0];
     int cmd = (int)args[1];
     win32_window_t *w = user_get_window(hwnd);
@@ -540,7 +594,10 @@ static uint32_t u32_ShowWindow(win32_process_t *proc, uint32_t *args) {
         w->visible = (cmd != SW_HIDE);
         w->needs_redraw = true;
         s_windows_dirty = true;
-        s_active_hwnd = hwnd;
+        if (!(w->style & WS_CHILD)) s_active_hwnd = hwnd;
+        if (w->visible) {
+            user_send_message(proc, hwnd, WM_SIZE, 0, ((uint32_t)w->client_h << 16) | (w->client_w & 0xFFFF), NULL);
+        }
         user_post_message(hwnd, WM_PAINT, 0, 0);
         return 1;
     }
@@ -796,8 +853,6 @@ static uint32_t u32_EndPaint(win32_process_t *proc, uint32_t *args) {
     return 1;
 }
 
-static H_HDC s_desktop_hdc = 0;
-
 static uint32_t u32_GetDC(win32_process_t *proc, uint32_t *args) {
     (void)proc;
     H_HWND hwnd = (H_HWND)args[0];
@@ -832,10 +887,59 @@ void user_inject_mouse_down(int screen_x, int screen_y, bool right_button) {
     s_cursor_pos.x = screen_x;
     s_cursor_pos.y = screen_y;
 
+    /* 0. If a popup dropdown menu is currently open, check if the click hits it */
+    if (s_open_menu_hwnd != 0 && s_open_menu_idx >= 0) {
+        win32_window_t *mw = user_get_window(s_open_menu_hwnd);
+        if (mw && mw->menu != 0) {
+            int m_slot = (int)(mw->menu - 0x5000);
+            if (m_slot >= 1 && m_slot < MAX_MENUS && s_menus[m_slot].in_use) {
+                win32_menu_t *m = &s_menus[m_slot];
+                if (s_open_menu_idx < m->item_count && m->items[s_open_menu_idx].hsub != 0) {
+                    int sub_slot = (int)(m->items[s_open_menu_idx].hsub - 0x5000);
+                    if (sub_slot >= 1 && sub_slot < MAX_MENUS && s_menus[sub_slot].in_use) {
+                        win32_menu_t *sub = &s_menus[sub_slot];
+                        int sx = 0, sy = 0;
+                        get_window_screen_pos(mw, &sx, &sy);
+                        int drop_x = sx + 10;
+                        for (int k = 0; k < s_open_menu_idx; k++) {
+                            drop_x += (int)strlen(m->items[k].title) * 8 + 14;
+                        }
+                        int drop_y = sy + 43;
+                        int drop_w = 180;
+                        for (int idx = 0; idx < sub->item_count; idx++) {
+                            int iw = (int)strlen(sub->items[idx].title) * 8 + 20;
+                            if (iw > drop_w) drop_w = iw;
+                        }
+                        int drop_h = sub->item_count * 18 + 6;
+                        if (screen_x >= drop_x && screen_x < drop_x + drop_w &&
+                            screen_y >= drop_y && screen_y < drop_y + drop_h) {
+                            int idx = (screen_y - (drop_y + 3)) / 18;
+                            if (idx >= 0 && idx < sub->item_count) {
+                                uint32_t cmd_id = sub->items[idx].id;
+                                s_open_menu_hwnd = 0;
+                                s_open_menu_idx = -1;
+                                s_windows_dirty = true;
+                                if (cmd_id != 0 && !(sub->items[idx].flags & 0x0800)) {
+                                    user_post_message(mw->hwnd, WM_COMMAND, cmd_id, 0);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        s_open_menu_hwnd = 0;
+        s_open_menu_idx = -1;
+        s_windows_dirty = true;
+    }
+
     /* Find top-most window hit (children before parents) */
     for (int i = MAX_WINDOWS - 1; i >= 1; i--) {
         if (!s_windows[i].in_use || !s_windows[i].visible) continue;
         win32_window_t *w = &s_windows[i];
+        /* Static labels without SS_NOTIFY are transparent to mouse hits */
+        if (w->wndproc == BUILTIN_WNDPROC_STATIC && !(w->style & 0x0100 /* SS_NOTIFY */)) continue;
         int sx = 0, sy = 0;
         get_window_screen_pos(w, &sx, &sy);
         if (screen_x >= sx && screen_x < sx + w->width &&
@@ -851,6 +955,12 @@ void user_inject_mouse_down(int screen_x, int screen_y, bool right_button) {
             bool has_caption = (w->style & WS_CAPTION) == WS_CAPTION;
 
             if (has_caption && rel_y < 23) {
+                /* Check Close ('X') button hit */
+                int btn_right = w->width - 5;
+                if ((w->style & WS_SYSMENU) && rel_x >= btn_right - 14 && rel_x <= btn_right) {
+                    user_post_message(w->hwnd, WM_CLOSE, 0, 0);
+                    return;
+                }
                 UINT msg = right_button ? 0x00A4 /* WM_NCRBUTTONDOWN */ : 0x00A1 /* WM_NCLBUTTONDOWN */;
                 user_post_message(w->hwnd, msg, 2 /* HTCAPTION */, lp);
             } else if (!is_child && w->menu != 0 && rel_y >= 23 && rel_y < w->client_y) {
@@ -862,8 +972,14 @@ void user_inject_mouse_down(int screen_x, int screen_y, bool right_button) {
                     for (int mi = 0; mi < m->item_count; mi++) {
                         int item_w = (int)strlen(m->items[mi].title) * 8 + 14;
                         if (rel_x >= cur_x && rel_x < cur_x + item_w) {
-                            uint32_t cmd_id = m->items[mi].id ? m->items[mi].id : 510;
-                            user_post_message(w->hwnd, WM_COMMAND, cmd_id, 0);
+                            if (m->items[mi].hsub != 0) {
+                                s_open_menu_hwnd = w->hwnd;
+                                s_open_menu_idx = mi;
+                                s_windows_dirty = true;
+                                user_post_message(w->hwnd, 0x0117 /* WM_INITMENUPOPUP */, (WPARAM)m->items[mi].hsub, mi);
+                            } else if (m->items[mi].id != 0) {
+                                user_post_message(w->hwnd, WM_COMMAND, m->items[mi].id, 0);
+                            }
                             break;
                         }
                         cur_x += item_w;
@@ -953,10 +1069,41 @@ void user_inject_mouse_move(int screen_x, int screen_y) {
 
 void user_inject_key(int vkey, char ch, bool down) {
     if (s_active_hwnd) {
+        H_HWND target = s_active_hwnd;
+        /* If active window is a top-level frame containing a child Edit control, route keyboard input to the Edit control */
+        for (int i = 1; i < MAX_WINDOWS; i++) {
+            if (s_windows[i].in_use && s_windows[i].visible && s_windows[i].parent == s_active_hwnd &&
+                strcasecmp(s_windows[i].class_name, "Edit") == 0) {
+                target = s_windows[i].hwnd;
+                break;
+            }
+        }
         UINT msg = down ? WM_KEYDOWN : WM_KEYUP;
-        user_post_message(s_active_hwnd, msg, vkey, 0);
-        if (down && ch >= 32 && ch <= 126) {
-            user_post_message(s_active_hwnd, WM_CHAR, ch, 0);
+        user_post_message(target, msg, vkey, 0);
+        if (down && ((ch >= 32 && ch <= 126) || ch == '\b' || ch == '\r' || ch == '\n' || ch == '\t')) {
+            user_post_message(target, WM_CHAR, (uint8_t)ch, 0);
+        }
+    }
+}
+
+static void draw_canvas_text(uint8_t *canvas, int cw, int ch, int stride, int x, int y, const char *str, uint8_t color) {
+    if (!canvas || !str) return;
+    int len = (int)strlen(str);
+    for (int i = 0; i < len; i++) {
+        char c = str[i];
+        if (c < 32 || c > 126) c = ' ';
+        const uint8_t *glyph = GDI_FONT_8X8[c - 32];
+        for (int gy = 0; gy < 8; gy++) {
+            int py = y + gy;
+            if (py < 0 || py >= ch) continue;
+            uint8_t row = glyph[gy];
+            for (int gx = 0; gx < 8; gx++) {
+                int px = x + i * 8 + gx;
+                if (px < 0 || px >= cw) continue;
+                if (row & (0x80 >> gx)) {
+                    canvas[py * stride + px] = color;
+                }
+            }
         }
     }
 }
@@ -991,16 +1138,599 @@ void user_composite_windows(uint8_t *dest_canvas, int canvas_w, int canvas_h, in
             }
         }
     }
+
+    /* Render active dropdown popup menu overlay if open */
+    if (s_open_menu_hwnd != 0 && s_open_menu_idx >= 0) {
+        win32_window_t *mw = user_get_window(s_open_menu_hwnd);
+        if (mw && mw->visible && mw->menu != 0) {
+            int m_slot = (int)(mw->menu - 0x5000);
+            if (m_slot >= 1 && m_slot < MAX_MENUS && s_menus[m_slot].in_use) {
+                win32_menu_t *m = &s_menus[m_slot];
+                if (s_open_menu_idx < m->item_count && m->items[s_open_menu_idx].hsub != 0) {
+                    int sub_slot = (int)(m->items[s_open_menu_idx].hsub - 0x5000);
+                    if (sub_slot >= 1 && sub_slot < MAX_MENUS && s_menus[sub_slot].in_use) {
+                        win32_menu_t *sub = &s_menus[sub_slot];
+                        int sx = 0, sy = 0;
+                        get_window_screen_pos(mw, &sx, &sy);
+                        int drop_x = sx + 10;
+                        for (int k = 0; k < s_open_menu_idx; k++) {
+                            drop_x += (int)strlen(m->items[k].title) * 8 + 14;
+                        }
+                        int drop_y = sy + 43;
+                        int drop_w = 180;
+                        for (int idx = 0; idx < sub->item_count; idx++) {
+                            int iw = (int)strlen(sub->items[idx].title) * 8 + 20;
+                            if (iw > drop_w) drop_w = iw;
+                        }
+                        int drop_h = sub->item_count * 18 + 6;
+                        for (int dy = drop_y; dy < drop_y + drop_h && dy < canvas_h; dy++) {
+                            if (dy < 0) continue;
+                            for (int dx = drop_x; dx < drop_x + drop_w && dx < canvas_w; dx++) {
+                                if (dx < 0) continue;
+                                uint8_t c = 0xE0;
+                                if (dy == drop_y || dx == drop_x) c = 0xFF;
+                                else if (dy == drop_y + drop_h - 1 || dx == drop_x + drop_w - 1) c = 0x00;
+                                dest_canvas[dy * canvas_stride + dx] = c;
+                            }
+                        }
+                        for (int idx = 0; idx < sub->item_count; idx++) {
+                            int iy = drop_y + 3 + idx * 18;
+                            if (sub->items[idx].flags & 0x0800) {
+                                for (int dx = drop_x + 4; dx < drop_x + drop_w - 4 && dx < canvas_w; dx++) {
+                                    if (iy + 8 < canvas_h) dest_canvas[(iy + 8) * canvas_stride + dx] = 0x80;
+                                }
+                            } else {
+                                draw_canvas_text(dest_canvas, canvas_w, canvas_h, canvas_stride, drop_x + 8, iy + 4, sub->items[idx].title, 0x00);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static char wide_char_to_ascii(uint16_t ch) {
+    if (ch > 0 && ch < 128) return (char)ch;
+    switch (ch) {
+        case 0x0131: return 'i'; /* ı */
+        case 0x0130: return 'I'; /* İ */
+        case 0x015F: return 's'; /* ş */
+        case 0x015E: return 'S'; /* Ş */
+        case 0x011F: return 'g'; /* ğ */
+        case 0x011E: return 'G'; /* Ğ */
+        case 0x00FC: case 0x00FB: case 0x00F9: case 0x00FA: return 'u';
+        case 0x00DC: case 0x00DB: case 0x00D9: case 0x00DA: return 'U';
+        case 0x00F6: case 0x00F4: case 0x00F2: case 0x00F3: return 'o';
+        case 0x00D6: case 0x00D4: case 0x00D2: case 0x00D3: return 'O';
+        case 0x00E7: return 'c'; /* ç */
+        case 0x00C7: return 'C'; /* Ç */
+        case 0x00E4: case 0x00E2: case 0x00E0: case 0x00E1: return 'a';
+        case 0x00C4: case 0x00C2: case 0x00C0: case 0x00C1: return 'A';
+        case 0x00EB: case 0x00EA: case 0x00E8: case 0x00E9: return 'e';
+        case 0x00CB: case 0x00CA: case 0x00C8: case 0x00C9: return 'E';
+        case 0x00A0: return ' ';
+        default: return '?';
+    }
 }
 
 static void wchar_to_ascii(const uint16_t *src, char *dst, size_t max_len) {
     if (!src || !dst || max_len == 0) return;
     size_t i = 0;
     while (src[i] != 0 && i < max_len - 1) {
-        dst[i] = (char)(src[i] & 0x7F);
+        dst[i] = wide_char_to_ascii(src[i]);
         i++;
     }
     dst[i] = '\0';
+}
+
+static void ensure_edit_buf(win32_window_t *w, int min_cap) {
+    if (!w) return;
+    if (min_cap < 4096) min_cap = 4096;
+    if (!w->edit_buf) {
+        w->edit_buf = (char *)calloc(min_cap, 1);
+        w->edit_cap = min_cap;
+        w->edit_len = 0;
+        if (w->title[0]) {
+            strncpy(w->edit_buf, w->title, min_cap - 1);
+            w->edit_len = (int)strlen(w->edit_buf);
+            w->edit_caret = w->edit_len;
+        }
+    } else if (min_cap > w->edit_cap) {
+        char *nb = (char *)realloc(w->edit_buf, min_cap);
+        if (nb) {
+            memset(nb + w->edit_cap, 0, min_cap - w->edit_cap);
+            w->edit_buf = nb;
+            w->edit_cap = min_cap;
+        }
+    }
+}
+
+static void sync_edit_guest_handle(win32_process_t *proc, win32_window_t *w) {
+    if (!proc || !w) return;
+    ensure_edit_buf(w, 4096);
+    if (!w->edit_guest_handle) {
+        uint32_t heap_args[3] = { 0x00010000, 0x00000008, 65536 };
+        w->edit_guest_handle = k32_HeapAlloc(proc, heap_args);
+    }
+    if (w->edit_guest_handle) {
+        /* Write both UTF-16 and ASCII depending on window creation, Notepad10 uses UTF-16 LocalLock(EM_GETHANDLE) */
+        int max_chars = (w->edit_len < 32000) ? w->edit_len : 32000;
+        for (int i = 0; i < max_chars; i++) {
+            uint16_t ch = (uint8_t)w->edit_buf[i];
+            guest_mem_write(&proc->mem, w->edit_guest_handle + i * 2, &ch, 2);
+        }
+        uint16_t zero = 0;
+        guest_mem_write(&proc->mem, w->edit_guest_handle + max_chars * 2, &zero, 2);
+    }
+}
+
+static void paint_builtin_control(win32_window_t *w, GUEST_PTR wndproc) {
+    if (!w || !w->framebuffer || w->width <= 0 || w->height <= 0) return;
+    uint8_t *fb = w->framebuffer;
+    int bw = w->width;
+    int bh = w->height;
+    int stride = w->fb_stride;
+
+    if (wndproc == BUILTIN_WNDPROC_EDIT) {
+        ensure_edit_buf(w, 4096);
+        fill_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFFFFFFF);
+        if ((w->style & WS_BORDER) || (w->ex_style & 0x0200 /* WS_EX_CLIENTEDGE */)) {
+            draw_3d_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFF808080, 0xFFFFFFFF);
+            if (bw > 2 && bh > 2) {
+                draw_3d_rect_argb(fb, stride, bw, bh, 1, 1, bw - 2, bh - 2, 0xFF000000, 0xFFDFDFDF);
+            }
+        }
+        int pad_x = 6, pad_y = 6;
+        int cur_x = pad_x, cur_y = pad_y;
+        int caret_px = pad_x, caret_py = pad_y;
+        for (int i = 0; i <= w->edit_len; i++) {
+            if (i == w->edit_caret) {
+                caret_px = cur_x;
+                caret_py = cur_y;
+            }
+            if (i == w->edit_len) break;
+            char c = w->edit_buf[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                cur_x = pad_x;
+                cur_y += 12;
+                continue;
+            }
+            if (c == '\t') {
+                cur_x += 32;
+                continue;
+            }
+            if (cur_x + 8 > bw - 4) {
+                if (!(w->style & 0x0040 /* ES_AUTOHSCROLL */)) {
+                    cur_x = pad_x;
+                    cur_y += 12;
+                }
+            }
+            if (cur_y + 8 < bh) {
+                char tmp[2] = { c, 0 };
+                draw_text_argb(fb, stride, bw, bh, cur_x, cur_y, tmp, 0xFF000000);
+            }
+            cur_x += 8;
+        }
+        /* Draw blinking/solid vertical caret if active or child of active */
+        if (caret_py + 10 < bh && caret_px < bw - 2) {
+            fill_rect_argb(fb, stride, bw, bh, caret_px, caret_py - 1, 2, 10, 0xFF000000);
+        }
+    } else if (wndproc == BUILTIN_WNDPROC_BUTTON) {
+        uint32_t btype = w->style & 0x0F;
+        if (btype == 7 /* BS_GROUPBOX */) {
+            fill_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFC0C0C0);
+            draw_3d_rect_argb(fb, stride, bw, bh, 0, 4, bw, bh - 4, 0xFF808080, 0xFFFFFFFF);
+            draw_3d_rect_argb(fb, stride, bw, bh, 1, 5, bw - 2, bh - 6, 0xFFFFFFFF, 0xFF808080);
+            if (w->title[0]) {
+                int tw = (int)strlen(w->title) * 8;
+                fill_rect_argb(fb, stride, bw, bh, 8, 0, tw + 4, 10, 0xFFC0C0C0);
+                draw_text_argb(fb, stride, bw, bh, 10, 1, w->title, 0xFF000000);
+            }
+        } else if (btype == 2 || btype == 3 || btype == 4 || btype == 9) {
+            /* Checkbox / Radio button */
+            fill_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFC0C0C0);
+            int by = (bh - 12) / 2;
+            fill_rect_argb(fb, stride, bw, bh, 2, by, 12, 12, 0xFFFFFFFF);
+            draw_3d_rect_argb(fb, stride, bw, bh, 2, by, 12, 12, 0xFF808080, 0xFFFFFFFF);
+            if (w->btn_check_state) {
+                fill_rect_argb(fb, stride, bw, bh, 5, by + 3, 6, 6, 0xFF000000);
+            }
+            if (w->title[0]) {
+                draw_text_argb(fb, stride, bw, bh, 18, (bh - 8) / 2, w->title, 0xFF000000);
+            }
+        } else {
+            /* Push button */
+            fill_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFC0C0C0);
+            if (w->btn_pressed) {
+                draw_3d_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFF000000, 0xFFFFFFFF);
+                draw_3d_rect_argb(fb, stride, bw, bh, 1, 1, bw - 2, bh - 2, 0xFF808080, 0xFFDFDFDF);
+            } else {
+                draw_3d_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFFFFFFF, 0xFF000000);
+                draw_3d_rect_argb(fb, stride, bw, bh, 1, 1, bw - 2, bh - 2, 0xFFDFDFDF, 0xFF808080);
+            }
+            if (w->title[0]) {
+                int tw = (int)strlen(w->title) * 8;
+                int tx = (bw - tw) / 2 + (w->btn_pressed ? 1 : 0);
+                int ty = (bh - 8) / 2 + (w->btn_pressed ? 1 : 0);
+                draw_text_argb(fb, stride, bw, bh, tx, ty, w->title, w->enabled ? 0xFF000000 : 0xFF808080);
+            }
+        }
+    } else if (wndproc == BUILTIN_WNDPROC_STATIC) {
+        fill_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFFFFFFF);
+        if ((w->style & 0x1000 /* SS_SUNKEN */) || (w->style & WS_BORDER) || (w->ex_style & 0x0200 /* WS_EX_CLIENTEDGE */)) {
+            draw_3d_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFF808080, 0xFF000000);
+        }
+        if (w->title[0]) {
+            int tx = 4;
+            if ((w->style & 0x0F) == 1 /* SS_CENTER */) {
+                tx = (bw - (int)strlen(w->title) * 8) / 2;
+            } else if ((w->style & 0x0F) == 2 /* SS_RIGHT */) {
+                tx = bw - (int)strlen(w->title) * 8 - 4;
+            }
+            draw_text_argb(fb, stride, bw, bh, tx, (bh - 8) / 2, w->title, 0xFF000000);
+        }
+    } else if (wndproc == BUILTIN_WNDPROC_STATUSBAR) {
+        fill_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFC0C0C0);
+        draw_3d_rect_argb(fb, stride, bw, bh, 0, 0, bw, bh, 0xFFFFFFFF, 0xFF808080);
+        if (w->sb_simple || w->sb_part_count <= 0) {
+            const char *txt = w->sb_simple ? w->sb_simple_text : (w->sb_texts[0][0] ? w->sb_texts[0] : w->title);
+            draw_3d_rect_argb(fb, stride, bw, bh, 2, 2, bw - 4, bh - 4, 0xFF808080, 0xFFFFFFFF);
+            if (txt && txt[0]) {
+                draw_text_argb(fb, stride, bw, bh, 6, (bh - 8) / 2, txt, 0xFF000000);
+            }
+        } else {
+            int prev_right = 2;
+            for (int i = 0; i < w->sb_part_count && i < 16; i++) {
+                int right = w->sb_parts[i];
+                if (right < 0 || right > bw - 2) right = bw - 2;
+                int pw = right - prev_right - 2;
+                if (pw > 4) {
+                    draw_3d_rect_argb(fb, stride, bw, bh, prev_right, 2, pw, bh - 4, 0xFF808080, 0xFFFFFFFF);
+                    if (w->sb_texts[i][0]) {
+                        /* Strip leading tab if present (Win32 statusbar centers text after \t) */
+                        const char *t = w->sb_texts[i];
+                        while (*t == '\t') t++;
+                        draw_text_argb(fb, stride, bw, bh, prev_right + 4, (bh - 8) / 2, t, 0xFF000000);
+                    }
+                }
+                prev_right = right;
+            }
+        }
+    }
+}
+
+static LRESULT builtin_wndproc_dispatch(win32_process_t *proc, win32_window_t *w, GUEST_PTR wndproc, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (!w) return 0;
+
+    if (wndproc == BUILTIN_WNDPROC_EDIT) {
+        ensure_edit_buf(w, 4096);
+        switch (msg) {
+            case WM_CREATE:
+            case WM_SIZE:
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 0;
+            case WM_PAINT:
+            case 0x0014 /* WM_ERASEBKGND */:
+                paint_builtin_control(w, wndproc);
+                s_windows_dirty = true;
+                return 1;
+            case 0x000C /* WM_SETTEXT */:
+                if (lParam) {
+                    uint16_t wbuf[1024] = {0};
+                    guest_mem_read(&proc->mem, lParam, wbuf, sizeof(wbuf) - 2);
+                    /* Detect whether string is ASCII or UTF-16 */
+                    uint8_t raw[4] = {0};
+                    guest_mem_read(&proc->mem, lParam, raw, 4);
+                    if (raw[0] != 0 && raw[1] == 0) {
+                        /* Likely UTF-16 */
+                        int i = 0;
+                        while (i < 1023 && wbuf[i]) {
+                            w->edit_buf[i] = (char)(wbuf[i] & 0x7F);
+                            i++;
+                        }
+                        w->edit_buf[i] = '\0';
+                        w->edit_len = i;
+                    } else {
+                        const char *s = (const char *)guest_va_to_host(&proc->mem, lParam);
+                        if (s) {
+                            strncpy(w->edit_buf, s, w->edit_cap - 1);
+                            w->edit_len = (int)strlen(w->edit_buf);
+                        }
+                    }
+                } else {
+                    w->edit_buf[0] = '\0';
+                    w->edit_len = 0;
+                }
+                w->edit_caret = w->edit_len;
+                strncpy(w->title, w->edit_buf, sizeof(w->title) - 1);
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 1;
+            case 0x000D /* WM_GETTEXT */: {
+                int max_c = (int)wParam;
+                if (lParam && max_c > 0) {
+                    int copy_len = (w->edit_len < max_c - 1) ? w->edit_len : (max_c - 1);
+                    for (int i = 0; i < copy_len; i++) {
+                        uint16_t ch = (uint8_t)w->edit_buf[i];
+                        guest_mem_write(&proc->mem, lParam + i * 2, &ch, 2);
+                    }
+                    uint16_t z = 0;
+                    guest_mem_write(&proc->mem, lParam + copy_len * 2, &z, 2);
+                    return copy_len;
+                }
+                return 0;
+            }
+            case 0x000E /* WM_GETTEXTLENGTH */:
+                return w->edit_len;
+            case WM_CHAR: {
+                char ch = (char)(wParam & 0xFF);
+                if (ch == '\b') {
+                    if (w->edit_caret > 0 && w->edit_len > 0) {
+                        memmove(w->edit_buf + w->edit_caret - 1, w->edit_buf + w->edit_caret, w->edit_len - w->edit_caret + 1);
+                        w->edit_caret--;
+                        w->edit_len--;
+                        w->edit_modified = true;
+                    }
+                } else if (ch == '\r' || ch == '\n') {
+                    if (w->edit_len + 2 < w->edit_cap) {
+                        memmove(w->edit_buf + w->edit_caret + 2, w->edit_buf + w->edit_caret, w->edit_len - w->edit_caret + 1);
+                        w->edit_buf[w->edit_caret++] = '\r';
+                        w->edit_buf[w->edit_caret++] = '\n';
+                        w->edit_len += 2;
+                        w->edit_modified = true;
+                    }
+                } else if (ch >= 32 && ch <= 126) {
+                    if (w->edit_len + 1 < w->edit_cap) {
+                        memmove(w->edit_buf + w->edit_caret + 1, w->edit_buf + w->edit_caret, w->edit_len - w->edit_caret + 1);
+                        w->edit_buf[w->edit_caret++] = ch;
+                        w->edit_len++;
+                        w->edit_modified = true;
+                    }
+                }
+                strncpy(w->title, w->edit_buf, sizeof(w->title) - 1);
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                if (w->parent) {
+                    uint32_t id = (uint32_t)w->menu;
+                    user_post_message(w->parent, WM_COMMAND, (0x0300 /* EN_CHANGE */ << 16) | (id & 0xFFFF), (LPARAM)w->hwnd);
+                }
+                return 0;
+            }
+            case WM_KEYDOWN: {
+                if (wParam == 0x25 /* VK_LEFT */ && w->edit_caret > 0) w->edit_caret--;
+                else if (wParam == 0x27 /* VK_RIGHT */ && w->edit_caret < w->edit_len) w->edit_caret++;
+                else if (wParam == 0x24 /* VK_HOME */) w->edit_caret = 0;
+                else if (wParam == 0x23 /* VK_END */) w->edit_caret = w->edit_len;
+                else if (wParam == 0x2E /* VK_DELETE */ && w->edit_caret < w->edit_len) {
+                    memmove(w->edit_buf + w->edit_caret, w->edit_buf + w->edit_caret + 1, w->edit_len - w->edit_caret);
+                    w->edit_len--;
+                    w->edit_modified = true;
+                }
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 0;
+            }
+            case 0x00B0 /* EM_GETSEL */:
+                if (wParam) x86_mem_write32(&proc->cpu, wParam, w->edit_caret);
+                if (lParam) x86_mem_write32(&proc->cpu, lParam, w->edit_caret);
+                return (w->edit_caret << 16) | (w->edit_caret & 0xFFFF);
+            case 0x00B1 /* EM_SETSEL */:
+                w->edit_sel_start = (int)wParam;
+                w->edit_sel_end = (int)lParam;
+                if (w->edit_sel_end < 0 || w->edit_sel_end > w->edit_len) w->edit_caret = w->edit_len;
+                else w->edit_caret = w->edit_sel_end;
+                paint_builtin_control(w, wndproc);
+                return 1;
+            case 0x00B8 /* EM_GETMODIFY */:
+                return w->edit_modified ? 1 : 0;
+            case 0x00B9 /* EM_SETMODIFY */:
+                w->edit_modified = (wParam != 0);
+                return 0;
+            case 0x00BA /* EM_GETLINECOUNT */: {
+                int lines = 1;
+                for (int i = 0; i < w->edit_len; i++) if (w->edit_buf[i] == '\n') lines++;
+                return lines;
+            }
+            case 0x00BB /* EM_LINEINDEX */: {
+                int target_line = (int)wParam;
+                if (target_line < 0) {
+                    /* Current caret line */
+                    int last_nl = 0;
+                    for (int i = 0; i < w->edit_caret && i < w->edit_len; i++) {
+                        if (w->edit_buf[i] == '\n') last_nl = i + 1;
+                    }
+                    return last_nl;
+                }
+                int cur_line = 0;
+                for (int i = 0; i < w->edit_len; i++) {
+                    if (cur_line == target_line) return i;
+                    if (w->edit_buf[i] == '\n') cur_line++;
+                }
+                return (cur_line == target_line) ? w->edit_len : (LRESULT)-1;
+            }
+            case 0x00C1 /* EM_LINELENGTH */:
+                return w->edit_len;
+            case 0x00C2 /* EM_REPLACESEL */: {
+                if (lParam) {
+                    uint16_t wbuf[512] = {0};
+                    guest_mem_read(&proc->mem, lParam, wbuf, sizeof(wbuf) - 2);
+                    char ins[512] = {0};
+                    wchar_to_ascii(wbuf, ins, sizeof(ins));
+                    int ilen = (int)strlen(ins);
+                    if (w->edit_len + ilen < w->edit_cap) {
+                        memmove(w->edit_buf + w->edit_caret + ilen, w->edit_buf + w->edit_caret, w->edit_len - w->edit_caret + 1);
+                        memcpy(w->edit_buf + w->edit_caret, ins, ilen);
+                        w->edit_caret += ilen;
+                        w->edit_len += ilen;
+                        w->edit_modified = true;
+                        paint_builtin_control(w, wndproc);
+                        w->needs_redraw = true;
+                        s_windows_dirty = true;
+                    }
+                }
+                return 1;
+            }
+            case 0x00C9 /* EM_LINEFROMCHAR */: {
+                int pos = (int)wParam;
+                if (pos < 0 || pos > w->edit_len) pos = w->edit_caret;
+                int line = 0;
+                for (int i = 0; i < pos && i < w->edit_len; i++) {
+                    if (w->edit_buf[i] == '\n') line++;
+                }
+                return line;
+            }
+            case 0x00BD /* EM_GETHANDLE */:
+                sync_edit_guest_handle(proc, w);
+                return w->edit_guest_handle;
+            default:
+                return 0;
+        }
+    } else if (wndproc == BUILTIN_WNDPROC_BUTTON) {
+        switch (msg) {
+            case WM_CREATE:
+            case WM_PAINT:
+            case 0x0014 /* WM_ERASEBKGND */:
+                paint_builtin_control(w, wndproc);
+                s_windows_dirty = true;
+                return 1;
+            case WM_LBUTTONDOWN:
+                w->btn_pressed = true;
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 0;
+            case WM_LBUTTONUP:
+                w->btn_pressed = false;
+                if ((w->style & 0x0F) == 3 /* BS_AUTOCHECKBOX */) {
+                    w->btn_check_state = !w->btn_check_state;
+                } else if ((w->style & 0x0F) == 9 /* BS_AUTORADIOBUTTON */) {
+                    w->btn_check_state = 1;
+                }
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                if (w->parent) {
+                    uint32_t ctrl_id = (uint32_t)w->menu;
+                    user_post_message(w->parent, WM_COMMAND, ctrl_id & 0xFFFF, (LPARAM)w->hwnd);
+                }
+                return 0;
+            case 0x00F0 /* BM_GETCHECK */:
+                return w->btn_check_state;
+            case 0x00F1 /* BM_SETCHECK */:
+                w->btn_check_state = (int)wParam;
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 0;
+            case 0x00F2 /* BM_GETSTATE */:
+                return (w->btn_pressed ? 0x0004 : 0) | w->btn_check_state;
+            case 0x00F3 /* BM_SETSTATE */:
+                w->btn_pressed = (wParam != 0);
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 0;
+            default:
+                return 0;
+        }
+    } else if (wndproc == BUILTIN_WNDPROC_STATIC) {
+        switch (msg) {
+            case WM_CREATE:
+            case WM_PAINT:
+            case 0x0014 /* WM_ERASEBKGND */:
+                paint_builtin_control(w, wndproc);
+                s_windows_dirty = true;
+                return 1;
+            default:
+                return 0;
+        }
+    } else if (wndproc == BUILTIN_WNDPROC_STATUSBAR) {
+        switch (msg) {
+            case WM_CREATE:
+            case WM_PAINT:
+            case 0x0014 /* WM_ERASEBKGND */:
+                paint_builtin_control(w, wndproc);
+                s_windows_dirty = true;
+                return 1;
+            case WM_SIZE: {
+                win32_window_t *pw = user_get_window(w->parent);
+                if (pw) {
+                    int nh = 22;
+                    int nw = pw->client_w;
+                    int nx = 0;
+                    int ny = pw->client_h - nh;
+                    if (ny < 0) ny = 0;
+                    if (nw > 0 && (w->width != nw || w->height != nh || w->x != nx || w->y != ny)) {
+                        w->x = nx;
+                        w->y = ny;
+                        w->width = nw;
+                        w->height = nh;
+                        w->fb_stride = nw * 4;
+                        if (w->framebuffer) free(w->framebuffer);
+                        w->framebuffer = allocate_window_framebuffer(nw, nh, 0xFFC0C0C0);
+                        update_window_client_area(w);
+                    }
+                }
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 0;
+            }
+            case 0x0404 /* SB_SETPARTS */: {
+                int count = (int)wParam;
+                if (count > 16) count = 16;
+                w->sb_part_count = count;
+                if (lParam && count > 0) {
+                    guest_mem_read(&proc->mem, lParam, w->sb_parts, count * sizeof(int));
+                }
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 1;
+            }
+            case 0x0401 /* SB_SETTEXTA */:
+            case 0x040B /* SB_SETTEXTW */: {
+                int part = (int)(wParam & 0xFF);
+                char buf[128] = {0};
+                if (lParam) {
+                    if (msg == 0x040B) {
+                        uint16_t wbuf[128] = {0};
+                        guest_mem_read(&proc->mem, lParam, wbuf, sizeof(wbuf) - 2);
+                        wchar_to_ascii(wbuf, buf, sizeof(buf));
+                    } else {
+                        const char *s = (const char *)guest_va_to_host(&proc->mem, lParam);
+                        if (s) strncpy(buf, s, sizeof(buf) - 1);
+                    }
+                }
+                if (part == 255) {
+                    strncpy(w->sb_simple_text, buf, sizeof(w->sb_simple_text) - 1);
+                } else if (part >= 0 && part < 16) {
+                    strncpy(w->sb_texts[part], buf, sizeof(w->sb_texts[part]) - 1);
+                    if (part >= w->sb_part_count) w->sb_part_count = part + 1;
+                }
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 1;
+            }
+            case 0x0409 /* SB_SIMPLE */:
+                w->sb_simple = (wParam != 0);
+                paint_builtin_control(w, wndproc);
+                w->needs_redraw = true;
+                s_windows_dirty = true;
+                return 1;
+            default:
+                return 0;
+        }
+    }
+    return 0;
 }
 
 static uint32_t u32_LoadStringW(win32_process_t *proc, uint32_t *args) {
@@ -1028,11 +1758,12 @@ static uint32_t u32_RegisterClassW(win32_process_t *proc, uint32_t *args) {
     uint32_t wc_va = args[0];
     if (!wc_va || s_class_count >= MAX_CLASSES) return 0;
 
-    uint32_t wndproc = 0, name_va = 0, icon = 0, cursor = 0, brush = 0;
+    uint32_t wndproc = 0, name_va = 0, icon = 0, cursor = 0, brush = 0, menu_va = 0;
     guest_mem_read(&proc->mem, wc_va + 4, &wndproc, 4);
     guest_mem_read(&proc->mem, wc_va + 20, &icon, 4);
     guest_mem_read(&proc->mem, wc_va + 24, &cursor, 4);
     guest_mem_read(&proc->mem, wc_va + 28, &brush, 4);
+    guest_mem_read(&proc->mem, wc_va + 32, &menu_va, 4);
     guest_mem_read(&proc->mem, wc_va + 36, &name_va, 4);
 
     uint16_t wide_name[64] = {0};
@@ -1045,8 +1776,9 @@ static uint32_t u32_RegisterClassW(win32_process_t *proc, uint32_t *args) {
     s_classes[s_class_count].icon = icon;
     s_classes[s_class_count].cursor = cursor;
     s_classes[s_class_count].background_brush = brush;
+    s_classes[s_class_count].menu_id = menu_va;
 
-    LOGI("RegisterClassW: %s (WndProc=0x%08X)", ascii_name, wndproc);
+    LOGI("RegisterClassW: %s (WndProc=0x%08X, menu=0x%X)", ascii_name, wndproc, menu_va);
     s_class_count++;
     return 0x0001;
 }
@@ -1078,10 +1810,10 @@ static uint32_t u32_CreateWindowExW(win32_process_t *proc, uint32_t *args) {
     }
 
     /* Standard Win32 default coordinates */
-    if (x == (int)0x80000000 || x < 0) x = (DEFAULT_SCREEN_W > 640) ? (DEFAULT_SCREEN_W - 640) / 2 : 40;
-    if (y == (int)0x80000000 || y < 0) y = (DEFAULT_SCREEN_H > 480) ? (DEFAULT_SCREEN_H - 480) / 2 : 40;
-    if (w <= 0 || w == (int)0x80000000) w = 640;
-    if (h <= 0 || h == (int)0x80000000) h = 480;
+    if (x == (int)0x80000000 || x < 0) x = (style & WS_CHILD) ? 0 : ((DEFAULT_SCREEN_W > 640) ? (DEFAULT_SCREEN_W - 640) / 2 : 40);
+    if (y == (int)0x80000000 || y < 0) y = (style & WS_CHILD) ? 0 : ((DEFAULT_SCREEN_H > 480) ? (DEFAULT_SCREEN_H - 480) / 2 : 40);
+    if (w <= 0 || w == (int)0x80000000) w = (style & WS_CHILD) ? 100 : 640;
+    if (h <= 0 || h == (int)0x80000000) h = (style & WS_CHILD) ? 20 : 480;
 
     int slot = -1;
     for (int i = 1; i < MAX_WINDOWS; i++) {
@@ -1111,6 +1843,9 @@ static uint32_t u32_CreateWindowExW(win32_process_t *proc, uint32_t *args) {
     for (int i = 0; i < s_class_count; i++) {
         if (strcasecmp(s_classes[i].class_name, win->class_name) == 0) {
             win->wndproc = s_classes[i].wndproc;
+            if (!(style & WS_CHILD) && win->menu == 0 && s_classes[i].menu_id != 0) {
+                win->menu = (H_HMENU)load_menu_internal(proc, s_classes[i].menu_id, true);
+            }
             break;
         }
     }
@@ -1132,11 +1867,12 @@ static uint32_t u32_CreateWindowExW(win32_process_t *proc, uint32_t *args) {
     update_window_client_area(win);
     paint_window_decorations(win);
 
-    s_active_hwnd = hwnd;
+    s_active_hwnd = (style & WS_CHILD) ? (s_active_hwnd ? s_active_hwnd : parent) : hwnd;
     LOGI("CreateWindowExW: '%s' (%s) -> HWND 0x%08X [%d,%d %dx%d]",
          win->title, win->class_name, hwnd, x, y, w, h);
 
     user_send_message(proc, hwnd, WM_CREATE, 0, 0, NULL);
+    user_send_message(proc, hwnd, WM_SIZE, 0, ((uint32_t)win->client_h << 16) | (win->client_w & 0xFFFF), NULL);
     return (uint32_t)hwnd;
 }
 
@@ -1201,17 +1937,22 @@ static uint32_t u32_MoveWindow(win32_process_t *proc, uint32_t *args) {
 
     win32_window_t *win = user_get_window(hwnd);
     if (win) {
-        if (x > 0) win->x = x;
-        if (y > 0) win->y = y;
+        if ((win->style & WS_CHILD) || x >= 0) win->x = x;
+        if ((win->style & WS_CHILD) || y >= 0) win->y = y;
         bool resized = false;
         if (w > 0 && h > 0 && (w != win->width || h != win->height)) {
             win->width = w;
             win->height = h;
             win->fb_stride = w * 4;
             if (win->framebuffer) free(win->framebuffer);
-            win->framebuffer = allocate_window_framebuffer(w, h, 0xFFC0C0C0);
+            uint32_t bg_col = (strcasecmp(win->class_name, "Edit") == 0) ? 0xFFFFFFFF : 0xFFC0C0C0;
+            win->framebuffer = allocate_window_framebuffer(w, h, bg_col);
             update_window_client_area(win);
-            paint_window_decorations(win);
+            if (win->wndproc >= 0xFE010000U && win->wndproc <= 0xFE0100FFU) {
+                paint_builtin_control(win, win->wndproc);
+            } else {
+                paint_window_decorations(win);
+            }
             resized = true;
         }
         if (resized || bRepaint) {
@@ -1365,12 +2106,35 @@ static uint32_t u32_EndDialog(win32_process_t *proc, uint32_t *args) {
     return 1;
 }
 
+static uint32_t u32_GetDlgItem(win32_process_t *proc, uint32_t *args);
+static uint32_t u32_GetWindowTextW(win32_process_t *proc, uint32_t *args);
+
 static uint32_t u32_SetDlgItemTextW(win32_process_t *proc, uint32_t *args) {
-    (void)proc; (void)args;
+    uint32_t gdi_args[2] = { args[0], args[1] };
+    H_HWND hctrl = (H_HWND)u32_GetDlgItem(proc, gdi_args);
+    if (hctrl) {
+        win32_window_t *cw = user_get_window(hctrl);
+        if (cw && args[2]) {
+            uint16_t wbuf[128] = {0};
+            guest_mem_read(&proc->mem, args[2], wbuf, sizeof(wbuf) - 2);
+            wchar_to_ascii(wbuf, cw->title, sizeof(cw->title));
+            if (cw->wndproc >= 0xFE010000U && cw->wndproc <= 0xFE0100FFU) {
+                paint_builtin_control(cw, cw->wndproc);
+            } else {
+                paint_window_decorations(cw);
+            }
+            cw->needs_redraw = true;
+            s_windows_dirty = true;
+        }
+    }
     return 1;
 }
 
 static uint32_t handle_send_message(win32_process_t *proc, H_HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, bool unicode) {
+    win32_window_t *w_check = user_get_window(hwnd);
+    if (w_check && w_check->wndproc >= 0xFE010000U && w_check->wndproc <= 0xFE0100FFU) {
+        return (uint32_t)builtin_wndproc_dispatch(proc, w_check, w_check->wndproc, msg, wParam, lParam);
+    }
     if (msg == 0x0220 /* WM_MDICREATE */) {
         uint32_t szClass_va = 0;
         uint32_t szTitle_va = 0;
@@ -1461,6 +2225,7 @@ static uint32_t handle_send_message(win32_process_t *proc, H_HWND hwnd, UINT msg
                 bm_obj->bitmap.bpp = 32;
                 bm_obj->bitmap.stride = win->fb_stride;
                 bm_obj->bitmap.bits = win->framebuffer;
+                bm_obj->bitmap.is_window_fb = true;
                 dc->selected_bitmap = (H_HBITMAP)hbm;
             }
         }
@@ -1510,12 +2275,26 @@ static uint32_t u32_SendMessageA(win32_process_t *proc, uint32_t *args) {
 
 static uint32_t u32_GetDlgItem(win32_process_t *proc, uint32_t *args) {
     (void)proc;
-    return 0x00004200 + args[1];
+    H_HWND hwndDlg = (H_HWND)args[0];
+    uint32_t ctrl_id = args[1];
+    for (int i = 1; i < MAX_WINDOWS; i++) {
+        if (s_windows[i].in_use && (hwndDlg == 0 || s_windows[i].parent == hwndDlg)) {
+            if (((uint32_t)s_windows[i].menu & 0xFFFF) == (ctrl_id & 0xFFFF)) {
+                return (uint32_t)s_windows[i].hwnd;
+            }
+        }
+    }
+    return 0;
 }
 
 static uint32_t u32_GetDlgItemTextW(win32_process_t *proc, uint32_t *args) {
+    H_HWND hctrl = (H_HWND)u32_GetDlgItem(proc, args);
     uint32_t buf_va = args[2];
     int max_len = (int)args[3];
+    if (hctrl) {
+        uint32_t gt_args[3] = { hctrl, buf_va, (uint32_t)max_len };
+        return u32_GetWindowTextW(proc, gt_args);
+    }
     if (buf_va && max_len > 0) {
         uint16_t zero = 0;
         guest_mem_write(&proc->mem, buf_va, &zero, sizeof(zero));
@@ -1523,7 +2302,313 @@ static uint32_t u32_GetDlgItemTextW(win32_process_t *proc, uint32_t *args) {
     return 0;
 }
 
+static const uint8_t *skip_dlg_sz_or_ord(const uint8_t *p, const uint8_t *end, char *out_str, size_t max_out, uint16_t *out_ord) {
+    if (out_str && max_out > 0) out_str[0] = '\0';
+    if (out_ord) *out_ord = 0;
+    if (p + 2 > end) return end;
+    uint16_t first = *(const uint16_t *)p;
+    if (first == 0x0000) {
+        return p + 2;
+    }
+    if (first == 0xFFFF) {
+        if (p + 4 <= end && out_ord) {
+            *out_ord = *(const uint16_t *)(p + 2);
+        }
+        return (p + 4 <= end) ? (p + 4) : end;
+    }
+    size_t i = 0;
+    while (p + 2 <= end) {
+        uint16_t ch = *(const uint16_t *)p;
+        p += 2;
+        if (ch == 0) break;
+        if (out_str && i + 1 < max_out && ch != '&') {
+            out_str[i++] = wide_char_to_ascii(ch);
+        }
+    }
+    if (out_str && max_out > 0) out_str[i] = '\0';
+    return p;
+}
+
+static uint32_t load_menu_internal(win32_process_t *proc, uint32_t menu_id_or_name, bool is_unicode);
+
+static uint32_t create_dialog_from_template(win32_process_t *proc, uint32_t tmpl_id_or_name, H_HWND hwndParent, GUEST_PTR dlgProc, LPARAM dwInitParam, bool is_unicode, bool is_direct_ptr) {
+    const uint8_t *data = NULL;
+    uint32_t data_sz = 4096;
+    if (is_direct_ptr) {
+        data = guest_va_to_host(&proc->mem, tmpl_id_or_name);
+    } else {
+        uint32_t rva = pe_find_resource_ex(proc, 5 /* RT_DIALOG */, tmpl_id_or_name, is_unicode, &data_sz);
+        if (rva) data = guest_va_to_host(&proc->mem, rva);
+    }
+
+    int slot = -1;
+    for (int i = 1; i < MAX_WINDOWS; i++) {
+        if (!s_windows[i].in_use) { slot = i; break; }
+    }
+    if (slot == -1) return 0;
+
+    H_HWND hwndDlg = (H_HWND)(0x4000 + slot);
+    win32_window_t *dlg = &s_windows[slot];
+    memset(dlg, 0, sizeof(win32_window_t));
+    dlg->in_use = true;
+    dlg->hwnd = hwndDlg;
+    dlg->parent = hwndParent;
+    dlg->wndproc = dlgProc;
+    dlg->enabled = true;
+    dlg->visible = true;
+    strcpy(dlg->class_name, "#32770");
+
+    if (!data || data_sz < 18) {
+        dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+        dlg->x = 120; dlg->y = 80; dlg->width = 360; dlg->height = 240;
+        dlg->hdc = gdi_create_window_dc(hwndDlg);
+        dlg->fb_stride = dlg->width * 4;
+        dlg->framebuffer = allocate_window_framebuffer(dlg->width, dlg->height, 0xFFC0C0C0);
+        update_window_client_area(dlg);
+        paint_window_decorations(dlg);
+        if (dlgProc) call_wndproc(proc, dlgProc, hwndDlg, 0x0110 /* WM_INITDIALOG */, 0, dwInitParam);
+        return (uint32_t)hwndDlg;
+    }
+
+    const uint8_t *end = data + data_sz;
+    const uint8_t *p = data;
+    bool is_ex = (*(const uint16_t *)(p + 0) == 1 && *(const uint16_t *)(p + 2) == 0xFFFF);
+
+    uint32_t style = 0, ex_style = 0;
+    uint16_t cdit = 0;
+    int16_t dx = 0, dy = 0, dcx = 200, dcy = 120;
+
+    if (is_ex && p + 26 <= end) {
+        ex_style = *(const uint32_t *)(p + 8);
+        style    = *(const uint32_t *)(p + 12);
+        cdit     = *(const uint16_t *)(p + 16);
+        dx       = *(const int16_t *)(p + 18);
+        dy       = *(const int16_t *)(p + 20);
+        dcx      = *(const int16_t *)(p + 22);
+        dcy      = *(const int16_t *)(p + 24);
+        p += 26;
+    } else {
+        style    = *(const uint32_t *)(p + 0);
+        ex_style = *(const uint32_t *)(p + 4);
+        cdit     = *(const uint16_t *)(p + 8);
+        dx       = *(const int16_t *)(p + 10);
+        dy       = *(const int16_t *)(p + 12);
+        dcx      = *(const int16_t *)(p + 14);
+        dcy      = *(const int16_t *)(p + 16);
+        p += 18;
+    }
+
+    /* Menu, Class, Title */
+    char dlg_menu_name[64] = {0};
+    uint16_t dlg_menu_ord = 0;
+    p = skip_dlg_sz_or_ord(p, end, dlg_menu_name, sizeof(dlg_menu_name), &dlg_menu_ord);
+    char dlg_class_name[64] = {0};
+    uint16_t dlg_class_ord = 0;
+    p = skip_dlg_sz_or_ord(p, end, dlg_class_name, sizeof(dlg_class_name), &dlg_class_ord);
+    p = skip_dlg_sz_or_ord(p, end, dlg->title, sizeof(dlg->title), NULL);
+
+    if (dlg_class_name[0] != '\0') {
+        strncpy(dlg->class_name, dlg_class_name, sizeof(dlg->class_name) - 1);
+        for (int k = 0; k < s_class_count; k++) {
+            if (strcasecmp(s_classes[k].class_name, dlg->class_name) == 0) {
+                if (!dlg->wndproc) dlg->wndproc = s_classes[k].wndproc;
+                if (!dlg->menu && s_classes[k].menu_id != 0) {
+                    dlg->menu = (H_HMENU)load_menu_internal(proc, s_classes[k].menu_id, is_unicode);
+                }
+                break;
+            }
+        }
+    }
+    if (dlg_menu_ord != 0 && !dlg->menu) {
+        dlg->menu = (H_HMENU)load_menu_internal(proc, dlg_menu_ord, false);
+    }
+
+    /* Font info if DS_SETFONT (0x40) or DS_SHELLFONT (0x48) */
+    if (style & 0x40) {
+        if (is_ex) {
+            if (p + 6 <= end) p += 6; /* pointsize, weight, italic, charset */
+        } else {
+            if (p + 2 <= end) p += 2; /* pointsize */
+        }
+        p = skip_dlg_sz_or_ord(p, end, NULL, 0, NULL); /* typeface */
+    }
+
+    int px_w = (dcx * 7) / 4 + 12;
+    int px_h = (dcy * 15) / 8 + 28;
+    if (px_w < 120) px_w = 240;
+    if (px_h < 80)  px_h = 160;
+    if (px_w > DEFAULT_SCREEN_W) px_w = DEFAULT_SCREEN_W - 20;
+    if (px_h > DEFAULT_SCREEN_H) px_h = DEFAULT_SCREEN_H - 20;
+
+    dlg->style = style | WS_VISIBLE;
+    dlg->ex_style = ex_style;
+    dlg->width = px_w;
+    dlg->height = px_h;
+    dlg->x = (dx > 0 && dx < 600) ? ((dx * 7) / 4) : ((DEFAULT_SCREEN_W - px_w) / 2);
+    dlg->y = (dy > 0 && dy < 400) ? ((dy * 15) / 8) : ((DEFAULT_SCREEN_H - px_h) / 2);
+    dlg->hdc = gdi_create_window_dc(hwndDlg);
+    dlg->fb_stride = px_w * 4;
+    dlg->framebuffer = allocate_window_framebuffer(px_w, px_h, 0xFFC0C0C0);
+    gdi_dc_t *dc = gdi_get_dc(dlg->hdc);
+    if (dc) {
+        H_HANDLE hbm = gdi_alloc_obj(GDI_OBJ_BITMAP);
+        gdi_object_t *bm_obj = gdi_get_obj(hbm);
+        if (bm_obj) {
+            bm_obj->bitmap.bpp = 32;
+            dc->selected_bitmap = (H_HBITMAP)hbm;
+        }
+    }
+    update_window_client_area(dlg);
+    paint_window_decorations(dlg);
+
+    LOGI("CreateDialog(%s): '%s' -> HWND 0x%04X [%d,%d %dx%d, %u items]",
+         is_ex ? "EX" : "STD", dlg->title, hwndDlg, dlg->x, dlg->y, dlg->width, dlg->height, cdit);
+
+    H_HWND first_ctrl = 0;
+    for (uint16_t idx = 0; idx < cdit && p < end; idx++) {
+        uintptr_t rel = (uintptr_t)(p - data);
+        if (rel & 3) p += (4 - (rel & 3));
+        if (p >= end) break;
+
+        uint32_t c_style = 0, c_ex_style = 0, c_id = 0;
+        int16_t cx = 0, cy = 0, ccx = 0, ccy = 0;
+
+        if (is_ex) {
+            if (p + 24 > end) break;
+            c_ex_style = *(const uint32_t *)(p + 4);
+            c_style    = *(const uint32_t *)(p + 8);
+            cx         = *(const int16_t *)(p + 12);
+            cy         = *(const int16_t *)(p + 14);
+            ccx        = *(const int16_t *)(p + 16);
+            ccy        = *(const int16_t *)(p + 18);
+            c_id       = *(const uint32_t *)(p + 20);
+            p += 24;
+        } else {
+            if (p + 18 > end) break;
+            c_style    = *(const uint32_t *)(p + 0);
+            c_ex_style = *(const uint32_t *)(p + 4);
+            cx         = *(const int16_t *)(p + 8);
+            cy         = *(const int16_t *)(p + 10);
+            ccx        = *(const int16_t *)(p + 12);
+            ccy        = *(const int16_t *)(p + 14);
+            c_id       = *(const uint16_t *)(p + 16);
+            p += 18;
+        }
+
+        char c_class[64] = {0};
+        uint16_t c_class_ord = 0;
+        p = skip_dlg_sz_or_ord(p, end, c_class, sizeof(c_class), &c_class_ord);
+        if (c_class_ord != 0) {
+            switch (c_class_ord) {
+                case 0x0080: strcpy(c_class, "Button"); break;
+                case 0x0081: strcpy(c_class, "Edit"); break;
+                case 0x0082: strcpy(c_class, "Static"); break;
+                case 0x0083: strcpy(c_class, "ListBox"); break;
+                case 0x0084: strcpy(c_class, "ScrollBar"); break;
+                case 0x0085: strcpy(c_class, "ComboBox"); break;
+                default:     strcpy(c_class, "Static"); break;
+            }
+        }
+
+        char c_title[128] = {0};
+        uint16_t c_title_ord = 0;
+        p = skip_dlg_sz_or_ord(p, end, c_title, sizeof(c_title), &c_title_ord);
+
+        /* Extra creation data */
+        if (p + 2 <= end) {
+            uint16_t extra_bytes = *(const uint16_t *)p;
+            p += 2;
+            if (extra_bytes > 0 && p + extra_bytes <= end) p += extra_bytes;
+        }
+
+        int c_slot = -1;
+        for (int i = 1; i < MAX_WINDOWS; i++) {
+            if (!s_windows[i].in_use) { c_slot = i; break; }
+        }
+        if (c_slot != -1) {
+            H_HWND hctrl = (H_HWND)(0x4000 + c_slot);
+            win32_window_t *cw = &s_windows[c_slot];
+            memset(cw, 0, sizeof(win32_window_t));
+            cw->in_use = true;
+            cw->hwnd = hctrl;
+            cw->parent = hwndDlg;
+            cw->style = c_style | WS_CHILD;
+            cw->ex_style = c_ex_style;
+            cw->menu = (H_HMENU)c_id;
+            cw->x = (cx * 7) / 4;
+            cw->y = (cy * 15) / 8;
+            cw->width = (ccx * 7) / 4;
+            cw->height = (ccy * 15) / 8;
+            if (cw->width < 8) cw->width = 24;
+            if (cw->height < 8) cw->height = 16;
+            cw->visible = (c_style & WS_VISIBLE) != 0;
+            cw->enabled = !(c_style & 0x08000000U /* WS_DISABLED */);
+            strncpy(cw->class_name, c_class, sizeof(cw->class_name) - 1);
+            strncpy(cw->title, c_title, sizeof(cw->title) - 1);
+
+            for (int k = 0; k < s_class_count; k++) {
+                if (strcasecmp(s_classes[k].class_name, cw->class_name) == 0) {
+                    cw->wndproc = s_classes[k].wndproc;
+                    break;
+                }
+            }
+
+            cw->hdc = gdi_create_window_dc(hctrl);
+            cw->fb_stride = cw->width * 4;
+            uint32_t bg_c = (strcasecmp(cw->class_name, "Edit") == 0) ? 0xFFFFFFFF : 0xFFC0C0C0;
+            cw->framebuffer = allocate_window_framebuffer(cw->width, cw->height, bg_c);
+            gdi_dc_t *cdc = gdi_get_dc(cw->hdc);
+            if (cdc) {
+                H_HANDLE hbm = gdi_alloc_obj(GDI_OBJ_BITMAP);
+                gdi_object_t *bm_obj = gdi_get_obj(hbm);
+                if (bm_obj) {
+                    bm_obj->bitmap.bpp = 32;
+                    cdc->selected_bitmap = (H_HBITMAP)hbm;
+                }
+            }
+            update_window_client_area(cw);
+            if (cw->wndproc >= 0xFE010000U && cw->wndproc <= 0xFE0100FFU) {
+                builtin_wndproc_dispatch(proc, cw, cw->wndproc, WM_CREATE, 0, 0);
+            } else {
+                paint_window_decorations(cw);
+            }
+            if (!first_ctrl) first_ctrl = hctrl;
+        }
+    }
+
+    s_active_hwnd = hwndDlg;
+    s_windows_dirty = true;
+    if (dlgProc) {
+        call_wndproc(proc, dlgProc, hwndDlg, 0x0110 /* WM_INITDIALOG */, (WPARAM)first_ctrl, dwInitParam);
+    } else if (dlg->wndproc && dlg->wndproc < 0xFE000000U) {
+        call_wndproc(proc, dlg->wndproc, hwndDlg, WM_CREATE, 0, 0);
+        call_wndproc(proc, dlg->wndproc, hwndDlg, 0x0110 /* WM_INITDIALOG */, (WPARAM)first_ctrl, dwInitParam);
+    }
+    return (uint32_t)hwndDlg;
+}
+
+static uint32_t u32_CreateDialogParamW(win32_process_t *proc, uint32_t *args) {
+    return create_dialog_from_template(proc, args[1], (H_HWND)args[2], args[3], args[4], true, false);
+}
+
+static uint32_t u32_CreateDialogParamA(win32_process_t *proc, uint32_t *args) {
+    return create_dialog_from_template(proc, args[1], (H_HWND)args[2], args[3], args[4], false, false);
+}
+
+static uint32_t u32_CreateDialogIndirectParamW(win32_process_t *proc, uint32_t *args) {
+    return create_dialog_from_template(proc, args[1], (H_HWND)args[2], args[3], args[4], true, true);
+}
+
+static uint32_t u32_CreateDialogIndirectParamA(win32_process_t *proc, uint32_t *args) {
+    return create_dialog_from_template(proc, args[1], (H_HWND)args[2], args[3], args[4], false, true);
+}
+
 static uint32_t u32_DialogBoxParamW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1; /* IDOK */
+}
+
+static uint32_t u32_DialogBoxParamA(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
     return 1; /* IDOK */
 }
@@ -1618,9 +2703,14 @@ static uint32_t u32_SetWindowPos(win32_process_t *proc, uint32_t *args) {
                 w->height = cy;
                 w->fb_stride = cx * 4;
                 if (w->framebuffer) free(w->framebuffer);
-                w->framebuffer = allocate_window_framebuffer(cx, cy, 0xFFC0C0C0);
+                uint32_t bg_col = (strcasecmp(w->class_name, "Edit") == 0) ? 0xFFFFFFFF : 0xFFC0C0C0;
+                w->framebuffer = allocate_window_framebuffer(cx, cy, bg_col);
                 update_window_client_area(w);
-                paint_window_decorations(w);
+                if (w->wndproc >= 0xFE010000U && w->wndproc <= 0xFE0100FFU) {
+                    paint_builtin_control(w, w->wndproc);
+                } else {
+                    paint_window_decorations(w);
+                }
                 w->needs_redraw = true;
                 s_windows_dirty = true;
                 user_post_message(hwnd, WM_PAINT, 0, 0);
@@ -1779,99 +2869,165 @@ static uint32_t u32_OpenIcon(win32_process_t *proc, uint32_t *args) {
     if (w) { w->minimized = false; w->needs_redraw = true; return 1; }
     return 0;
 }
-static uint32_t u32_LoadMenuW(win32_process_t *proc, uint32_t *args) {
-    uint32_t menu_id = args[1];
-    uint32_t data_sz = 0;
-    uint32_t menu_va = 0;
-
-    if (menu_id <= 0xFFFF && menu_id != 0) {
-        menu_va = pe_find_resource_data(proc, 4 /* RT_MENU */, menu_id, &data_sz);
-    }
-    if (!menu_va) {
-        menu_va = pe_find_resource_data(proc, 4, 265, &data_sz);
-        if (!menu_va) menu_va = pe_find_resource_data(proc, 4, 1, &data_sz);
-    }
-
-    int root_slot = -1;
+static int alloc_menu_slot(void) {
     for (int i = 1; i < MAX_MENUS; i++) {
-        if (!s_menus[i].in_use) { root_slot = i; break; }
+        if (!s_menus[i].in_use) {
+            memset(&s_menus[i], 0, sizeof(win32_menu_t));
+            s_menus[i].in_use = true;
+            s_menus[i].hmenu = (H_HMENU)(0x5000 + i);
+            return i;
+        }
     }
-    if (root_slot == -1) return 0x5001;
+    return -1;
+}
 
+static const uint8_t *parse_menu_v0_items(const uint8_t *p, const uint8_t *end, win32_menu_t *menu) {
+    while (p + 2 <= end) {
+        uint16_t flags = *(const uint16_t *)p;
+        p += 2;
+        uint16_t item_id = 0;
+        if (!(flags & 0x10 /* MF_POPUP */)) {
+            if (p + 2 > end) break;
+            item_id = *(const uint16_t *)p;
+            p += 2;
+        }
+
+        char title[48] = {0};
+        int ti = 0;
+        while (p + 2 <= end) {
+            uint16_t ch = *(const uint16_t *)p;
+            p += 2;
+            if (ch == 0) break;
+            if (ch == '\t') {
+                /* Skip accelerator shortcut after tab or keep space */
+                if (ti < 46) title[ti++] = ' ';
+                continue;
+            }
+            if (ti < 47 && ch != '&') title[ti++] = wide_char_to_ascii(ch);
+        }
+        title[ti] = '\0';
+
+        win32_menu_item_t *item = NULL;
+        if (menu && menu->item_count < MAX_MENU_ITEMS) {
+            item = &menu->items[menu->item_count++];
+            strncpy(item->title, title, sizeof(item->title) - 1);
+            item->flags = flags;
+            item->id = item_id;
+        }
+
+        if (flags & 0x10 /* MF_POPUP */) {
+            int sub_slot = alloc_menu_slot();
+            win32_menu_t *sub_menu = (sub_slot != -1) ? &s_menus[sub_slot] : NULL;
+            if (item && sub_menu) {
+                item->hsub = sub_menu->hmenu;
+            }
+            p = parse_menu_v0_items(p, end, sub_menu);
+        }
+
+        if (flags & 0x80 /* MF_END */) break;
+    }
+    return p;
+}
+
+static const uint8_t *parse_menu_v1_items(const uint8_t *base, const uint8_t *p, const uint8_t *end, win32_menu_t *menu) {
+    while (p < end) {
+        uintptr_t rel = (uintptr_t)(p - base);
+        if (rel & 3) p += (4 - (rel & 3));
+        if (p + 14 > end) break;
+
+        uint32_t dwType  = *(const uint32_t *)(p + 0);
+        uint32_t dwState = *(const uint32_t *)(p + 4);
+        uint32_t menuId  = *(const uint32_t *)(p + 8);
+        uint16_t bResInfo = *(const uint16_t *)(p + 12);
+        p += 14;
+
+        char title[48] = {0};
+        int ti = 0;
+        while (p + 2 <= end) {
+            uint16_t ch = *(const uint16_t *)p;
+            p += 2;
+            if (ch == 0) break;
+            if (ch == '\t') {
+                if (ti < 46) title[ti++] = ' ';
+                continue;
+            }
+            if (ti < 47 && ch != '&') title[ti++] = wide_char_to_ascii(ch);
+        }
+        title[ti] = '\0';
+
+        win32_menu_item_t *item = NULL;
+        if (menu && menu->item_count < MAX_MENU_ITEMS) {
+            item = &menu->items[menu->item_count++];
+            if (dwType & 0x0800 /* MFT_SEPARATOR */) {
+                strcpy(item->title, "---");
+                item->flags = 0x0800;
+            } else {
+                strncpy(item->title, title, sizeof(item->title) - 1);
+                item->flags = dwState;
+            }
+            item->id = menuId;
+        }
+
+        if (bResInfo & 0x01 /* Pop-up submenu */) {
+            uintptr_t r2 = (uintptr_t)(p - base);
+            if (r2 & 3) p += (4 - (r2 & 3));
+            if (p + 4 <= end) p += 4; /* Skip dwHelpId */
+
+            int sub_slot = alloc_menu_slot();
+            win32_menu_t *sub_menu = (sub_slot != -1) ? &s_menus[sub_slot] : NULL;
+            if (item && sub_menu) {
+                item->hsub = sub_menu->hmenu;
+            }
+            p = parse_menu_v1_items(base, p, end, sub_menu);
+        }
+
+        if (bResInfo & 0x80 /* Last item in level */) break;
+    }
+    return p;
+}
+
+static uint32_t load_menu_internal(win32_process_t *proc, uint32_t menu_id_or_name, bool is_unicode) {
+    uint32_t data_sz = 0;
+    uint32_t menu_va = pe_find_resource_ex(proc, 4 /* RT_MENU */, menu_id_or_name, is_unicode, &data_sz);
+    if (!menu_va) {
+        menu_va = pe_find_resource_ex(proc, 4, 1, false, &data_sz);
+        if (!menu_va) menu_va = pe_find_resource_ex(proc, 4, 0, false, &data_sz);
+    }
+
+    int root_slot = alloc_menu_slot();
+    if (root_slot == -1) return 0x5001;
     win32_menu_t *root_menu = &s_menus[root_slot];
-    memset(root_menu, 0, sizeof(win32_menu_t));
-    root_menu->in_use = true;
-    root_menu->hmenu = (H_HMENU)(0x5000 + root_slot);
 
     if (!menu_va || data_sz < 4) {
         return (uint32_t)root_menu->hmenu;
     }
 
-    uint8_t *menu_data = guest_va_to_host(&proc->mem, menu_va);
+    const uint8_t *menu_data = guest_va_to_host(&proc->mem, menu_va);
     if (!menu_data) return (uint32_t)root_menu->hmenu;
 
-    uint16_t off = *(uint16_t *)(menu_data + 2);
-    uint8_t *p = menu_data + 4 + off;
-    uint8_t *end = menu_data + data_sz;
+    uint16_t version = *(const uint16_t *)(menu_data + 0);
+    uint16_t offset  = *(const uint16_t *)(menu_data + 2);
+    const uint8_t *end = menu_data + data_sz;
 
-    while (p < end && root_menu->item_count < MAX_MENU_ITEMS) {
-        uint16_t flags = *(uint16_t *)p;
-        p += 2;
-        uint16_t item_id = 0;
-        if (!(flags & 0x10)) {
-            item_id = *(uint16_t *)p;
-            p += 2;
-        }
-
-        char title[32];
-        int ti = 0;
-        while (p + 2 <= end) {
-            uint16_t ch = *(uint16_t *)p;
-            p += 2;
-            if (ch == 0) break;
-            if (ti < 31 && ch != '&') title[ti++] = (char)ch;
-        }
-        title[ti] = '\0';
-
-        win32_menu_item_t *item = &root_menu->items[root_menu->item_count++];
-        strncpy(item->title, title, sizeof(item->title) - 1);
-        item->flags = flags;
-        item->id = item_id;
-
-        if (flags & 0x10) {
-            int sub_slot = -1;
-            for (int s = 1; s < MAX_MENUS; s++) {
-                if (!s_menus[s].in_use && s != root_slot) { sub_slot = s; break; }
-            }
-            if (sub_slot != -1) {
-                s_menus[sub_slot].in_use = true;
-                s_menus[sub_slot].hmenu = (H_HMENU)(0x5000 + sub_slot);
-                item->hsub = s_menus[sub_slot].hmenu;
-            }
-
-            int depth = 1;
-            while (depth > 0 && p < end) {
-                uint16_t cflags = *(uint16_t *)p;
-                p += 2;
-                if (!(cflags & 0x10)) {
-                    p += 2;
-                }
-                while (p + 2 <= end) {
-                    uint16_t ch = *(uint16_t *)p;
-                    p += 2;
-                    if (ch == 0) break;
-                }
-                if (cflags & 0x10) depth++;
-                if (cflags & 0x80) depth--;
-            }
-        }
-
-        if (flags & 0x80) break;
+    if (version == 1) {
+        const uint8_t *p = menu_data + 4 + offset;
+        parse_menu_v1_items(menu_data, p, end, root_menu);
+    } else {
+        const uint8_t *p = menu_data + 4 + offset;
+        parse_menu_v0_items(p, end, root_menu);
     }
 
-    LOGI("u32_LoadMenuW: Loaded menu 0x%04X with %d top-level items",
-         root_menu->hmenu, root_menu->item_count);
+    LOGI("load_menu_internal(v%u): Loaded menu 0x%04X with %d top-level items",
+         version, root_menu->hmenu, root_menu->item_count);
     return (uint32_t)root_menu->hmenu;
+}
+
+static uint32_t u32_LoadMenuW(win32_process_t *proc, uint32_t *args) {
+    return load_menu_internal(proc, args[1], true);
+}
+
+static uint32_t u32_LoadMenuA(win32_process_t *proc, uint32_t *args) {
+    return load_menu_internal(proc, args[1], false);
 }
 
 static uint32_t u32_GetSubMenu(win32_process_t *proc, uint32_t *args) {
@@ -1909,15 +3065,33 @@ static uint32_t u32_CheckRadioButton(win32_process_t *proc, uint32_t *args) {
     return 1;
 }
 static uint32_t u32_SendDlgItemMessageA(win32_process_t *proc, uint32_t *args) {
-    (void)proc; (void)args;
+    H_HWND hctrl = (H_HWND)u32_GetDlgItem(proc, args);
+    if (hctrl) {
+        return handle_send_message(proc, hctrl, args[2], args[3], args[4], false);
+    }
+    return 0;
+}
+static uint32_t u32_SendDlgItemMessageW(win32_process_t *proc, uint32_t *args) {
+    H_HWND hctrl = (H_HWND)u32_GetDlgItem(proc, args);
+    if (hctrl) {
+        return handle_send_message(proc, hctrl, args[2], args[3], args[4], true);
+    }
     return 0;
 }
 static uint32_t u32_SetDlgItemTextA(win32_process_t *proc, uint32_t *args) {
-    (void)proc; (void)args;
+    H_HWND hctrl = (H_HWND)u32_GetDlgItem(proc, args);
+    if (hctrl) {
+        uint32_t st_args[2] = { hctrl, args[2] };
+        return u32_SetWindowTextA(proc, st_args);
+    }
     return 1;
 }
 static uint32_t u32_GetDlgItemTextA(win32_process_t *proc, uint32_t *args) {
-    (void)proc;
+    H_HWND hctrl = (H_HWND)u32_GetDlgItem(proc, args);
+    if (hctrl) {
+        uint32_t gt_args[3] = { hctrl, args[2], args[3] };
+        return u32_GetWindowTextA(proc, gt_args);
+    }
     char *out_buf = (char *)guest_va_to_host(&proc->mem, args[2]);
     uint32_t max_sz = args[3];
     if (out_buf && max_sz > 0) {
@@ -1947,9 +3121,20 @@ static uint32_t u32_LoadStringA(win32_process_t *proc, uint32_t *args) {
     return 0;
 }
 
+static uint32_t u32_CallWindowProcW(win32_process_t *proc, uint32_t *args) {
+    GUEST_PTR prev_proc = args[0];
+    H_HWND hwnd = (H_HWND)args[1];
+    UINT msg = args[2];
+    WPARAM wParam = args[3];
+    LPARAM lParam = args[4];
+    return (uint32_t)call_wndproc(proc, prev_proc, hwnd, msg, wParam, lParam);
+}
+
 static uint32_t u32_CreateStatusWindowW(win32_process_t *proc, uint32_t *args) {
-    (void)proc;
+    uint32_t style = args[0];
+    uint32_t lpszText = args[1];
     H_HWND hwndParent = (H_HWND)args[2];
+    uint32_t wID = args[3];
     int slot = -1;
     for (int i = 1; i < MAX_WINDOWS; i++) {
         if (!s_windows[i].in_use) { slot = i; break; }
@@ -1961,10 +3146,52 @@ static uint32_t u32_CreateStatusWindowW(win32_process_t *proc, uint32_t *args) {
     w->in_use = true;
     w->hwnd = hwnd;
     w->parent = hwndParent;
-    w->visible = true;
-    w->width = 640;
-    w->height = 20;
+    w->style = style | WS_CHILD | WS_VISIBLE;
+    w->menu = (H_HMENU)wID;
+    w->visible = (style & WS_VISIBLE) != 0;
+    w->enabled = true;
+    w->wndproc = BUILTIN_WNDPROC_STATUSBAR;
     strcpy(w->class_name, "msctls_statusbar32");
+    if (lpszText) {
+        uint16_t wbuf[128] = {0};
+        guest_mem_read(&proc->mem, lpszText, wbuf, sizeof(wbuf) - 2);
+        wchar_to_ascii(wbuf, w->title, sizeof(w->title));
+        strncpy(w->sb_texts[0], w->title, sizeof(w->sb_texts[0]) - 1);
+    }
+    win32_window_t *pw = user_get_window(hwndParent);
+    w->width = pw ? pw->client_w : 640;
+    w->height = 22;
+    w->x = 0;
+    w->y = pw ? (pw->client_h - 22) : 400;
+    w->hdc = gdi_create_window_dc(hwnd);
+    w->fb_stride = w->width * 4;
+    w->framebuffer = allocate_window_framebuffer(w->width, w->height, 0xFFC0C0C0);
+    gdi_dc_t *dc = gdi_get_dc(w->hdc);
+    if (dc) {
+        H_HANDLE hbm = gdi_alloc_obj(GDI_OBJ_BITMAP);
+        gdi_object_t *bm_obj = gdi_get_obj(hbm);
+        if (bm_obj) {
+            bm_obj->bitmap.bpp = 32;
+            bm_obj->bitmap.is_window_fb = true;
+            dc->selected_bitmap = (H_HBITMAP)hbm;
+        }
+    }
+    update_window_client_area(w);
+    paint_builtin_control(w, w->wndproc);
+    /* If statusbar is initially visible, shrink any sibling Edit control filling the parent client area so it doesn't cover the statusbar */
+    if (w->visible && pw) {
+        for (int i = 1; i < MAX_WINDOWS; i++) {
+            win32_window_t *sib = &s_windows[i];
+            if (sib->in_use && sib != w && sib->parent == hwndParent && sib->height > w->y) {
+                sib->height = w->y;
+                if (sib->framebuffer) free(sib->framebuffer);
+                uint32_t bg_c = (strcasecmp(sib->class_name, "Edit") == 0) ? 0xFFFFFFFF : 0xFFC0C0C0;
+                sib->framebuffer = allocate_window_framebuffer(sib->width, sib->height, bg_c);
+                update_window_client_area(sib);
+                paint_builtin_control(sib, sib->wndproc);
+            }
+        }
+    }
     return (uint32_t)hwnd;
 }
 
@@ -2432,11 +3659,12 @@ static uint32_t u32_RegisterClassExW(win32_process_t *proc, uint32_t *args) {
     uint32_t wc_va = args[0];
     if (!wc_va || s_class_count >= MAX_CLASSES) return 0;
 
-    uint32_t wndproc = 0, name_va = 0, icon = 0, cursor = 0, brush = 0;
+    uint32_t wndproc = 0, name_va = 0, icon = 0, cursor = 0, brush = 0, menu_va = 0;
     guest_mem_read(&proc->mem, wc_va + 8, &wndproc, 4);
     guest_mem_read(&proc->mem, wc_va + 24, &icon, 4);
     guest_mem_read(&proc->mem, wc_va + 28, &cursor, 4);
     guest_mem_read(&proc->mem, wc_va + 32, &brush, 4);
+    guest_mem_read(&proc->mem, wc_va + 36, &menu_va, 4);
     guest_mem_read(&proc->mem, wc_va + 40, &name_va, 4);
 
     uint16_t wide_name[64] = {0};
@@ -2449,8 +3677,9 @@ static uint32_t u32_RegisterClassExW(win32_process_t *proc, uint32_t *args) {
     s_classes[s_class_count].icon = icon;
     s_classes[s_class_count].cursor = cursor;
     s_classes[s_class_count].background_brush = brush;
+    s_classes[s_class_count].menu_id = menu_va;
 
-    LOGI("RegisterClassExW: %s (WndProc=0x%08X)", ascii_name, wndproc);
+    LOGI("RegisterClassExW: %s (WndProc=0x%08X, menu=0x%X)", ascii_name, wndproc, menu_va);
     s_class_count++;
     return 0x0001;
 }
@@ -2459,11 +3688,12 @@ static uint32_t u32_RegisterClassExA(win32_process_t *proc, uint32_t *args) {
     uint32_t wc_va = args[0];
     if (!wc_va || s_class_count >= MAX_CLASSES) return 0;
 
-    uint32_t wndproc = 0, name_va = 0, icon = 0, cursor = 0, brush = 0;
+    uint32_t wndproc = 0, name_va = 0, icon = 0, cursor = 0, brush = 0, menu_va = 0;
     guest_mem_read(&proc->mem, wc_va + 8, &wndproc, 4);
     guest_mem_read(&proc->mem, wc_va + 24, &icon, 4);
     guest_mem_read(&proc->mem, wc_va + 28, &cursor, 4);
     guest_mem_read(&proc->mem, wc_va + 32, &brush, 4);
+    guest_mem_read(&proc->mem, wc_va + 36, &menu_va, 4);
     guest_mem_read(&proc->mem, wc_va + 40, &name_va, 4);
 
     const char *name = (const char *)guest_va_to_host(&proc->mem, name_va);
@@ -2474,8 +3704,9 @@ static uint32_t u32_RegisterClassExA(win32_process_t *proc, uint32_t *args) {
     s_classes[s_class_count].icon = icon;
     s_classes[s_class_count].cursor = cursor;
     s_classes[s_class_count].background_brush = brush;
+    s_classes[s_class_count].menu_id = menu_va;
 
-    LOGI("RegisterClassExA: %s (WndProc=0x%08X)", name, wndproc);
+    LOGI("RegisterClassExA: %s (WndProc=0x%08X, menu=0x%X)", name, wndproc, menu_va);
     s_class_count++;
     return 0x0001;
 }
@@ -2503,22 +3734,310 @@ static uint32_t u32_MsgWaitForMultipleObjects(win32_process_t *proc, uint32_t *a
     return 0; /* WAIT_OBJECT_0 */
 }
 
-static uint32_t u32_DrawTextW(win32_process_t *proc, uint32_t *args) {
-    (void)proc;
+static uint32_t u32_GetWindowRect(win32_process_t *proc, uint32_t *args) {
+    H_HWND hwnd = (H_HWND)args[0];
+    uint32_t rect_va = args[1];
+    win32_window_t *w = user_get_window(hwnd);
+    if (!rect_va) return 0;
+    WIN_RECT rc = { 0, 0, DEFAULT_SCREEN_W, DEFAULT_SCREEN_H };
+    if (w) {
+        int sx = w->x, sy = w->y;
+        win32_window_t *pw = user_get_window(w->parent);
+        if (pw) {
+            sx += pw->x + pw->client_x;
+            sy += pw->y + pw->client_y;
+        }
+        rc.left = sx;
+        rc.top = sy;
+        rc.right = sx + w->width;
+        rc.bottom = sy + w->height;
+    }
+    guest_mem_write(&proc->mem, rect_va, &rc, sizeof(rc));
+    return 1;
+}
+
+static uint32_t u32_ScreenToClient(win32_process_t *proc, uint32_t *args) {
+    H_HWND hwnd = (H_HWND)args[0];
+    uint32_t pt_va = args[1];
+    win32_window_t *w = user_get_window(hwnd);
+    if (!pt_va) return 0;
+    WIN_POINT pt = {0, 0};
+    guest_mem_read(&proc->mem, pt_va, &pt, sizeof(pt));
+    if (w) {
+        int sx = w->x + w->client_x;
+        int sy = w->y + w->client_y;
+        win32_window_t *pw = user_get_window(w->parent);
+        if (pw) {
+            sx += pw->x + pw->client_x;
+            sy += pw->y + pw->client_y;
+        }
+        pt.x -= sx;
+        pt.y -= sy;
+    }
+    guest_mem_write(&proc->mem, pt_va, &pt, sizeof(pt));
+    return 1;
+}
+
+static uint32_t u32_MapDialogRect(win32_process_t *proc, uint32_t *args) {
+    uint32_t rect_va = args[1];
+    if (!rect_va) return 0;
+    WIN_RECT rc = {0};
+    guest_mem_read(&proc->mem, rect_va, &rc, sizeof(rc));
+    rc.left   = (rc.left * 7) / 4;
+    rc.right  = (rc.right * 7) / 4;
+    rc.top    = (rc.top * 15) / 8;
+    rc.bottom = (rc.bottom * 15) / 8;
+    guest_mem_write(&proc->mem, rect_va, &rc, sizeof(rc));
+    return 1;
+}
+
+static uint32_t u32_GetSysColorBrush(win32_process_t *proc, uint32_t *args) {
+    int idx = (int)args[0];
+    uint32_t col = u32_GetSysColor(proc, args);
+    if (idx >= 0 && idx < 32) {
+        if (!s_sys_brushes[idx]) {
+            H_HANDLE h = gdi_alloc_obj(GDI_OBJ_BRUSH);
+            gdi_object_t *obj = gdi_get_obj(h);
+            if (obj) obj->brush.color = col;
+            s_sys_brushes[idx] = (H_HBRUSH)h;
+        }
+        return (uint32_t)s_sys_brushes[idx];
+    }
+    return 0;
+}
+
+static uint32_t u32_CharUpperA(win32_process_t *proc, uint32_t *args) {
+    uint32_t ptr = args[0];
+    if ((ptr & 0xFFFF0000) == 0) {
+        uint8_t ch = (uint8_t)ptr;
+        if (ch >= 'a' && ch <= 'z') ch -= ('a' - 'A');
+        return (uint32_t)ch;
+    }
+    char *str = (char *)guest_va_to_host(&proc->mem, ptr);
+    if (str) {
+        while (*str) {
+            if (*str >= 'a' && *str <= 'z') *str -= ('a' - 'A');
+            str++;
+        }
+    }
+    return ptr;
+}
+
+static uint32_t u32_DrawEdge(win32_process_t *proc, uint32_t *args) {
     H_HDC hdc = (H_HDC)args[0];
-    (void)hdc;
+    uint32_t qrc_va = args[1];
+    uint32_t edge = args[2];
+    uint32_t grfFlags = args[3];
+    if (!qrc_va) return 0;
+    WIN_RECT rc = {0};
+    guest_mem_read(&proc->mem, qrc_va, &rc, sizeof(rc));
+    gdi_dc_t *dc = gdi_get_dc(hdc);
+    if (!dc) return 0;
+    gdi_object_t *bm = gdi_get_obj((H_HANDLE)dc->selected_bitmap);
+    if (!bm || !bm->bitmap.bits) return 0;
+
+    bool sunk = (edge & 0x0002 /* BDR_SUNKENOUTER */) || (edge & 0x0008 /* BDR_SUNKENINNER */);
+    uint32_t c_tl_out = sunk ? 0xFF808080 : 0xFFFFFFFF;
+    uint32_t c_br_out = sunk ? 0xFFFFFFFF : 0xFF000000;
+    uint32_t c_tl_in  = sunk ? 0xFF000000 : 0xFFDFDFDF;
+    uint32_t c_br_in  = sunk ? 0xFFDFDFDF : 0xFF808080;
+
+    if (grfFlags & 0x0800 /* BF_MIDDLE */) {
+        for (int y = rc.top; y < rc.bottom; y++) {
+            if (y < 0 || y >= bm->bitmap.height) continue;
+            uint32_t *row = (uint32_t *)(bm->bitmap.bits + y * bm->bitmap.stride);
+            for (int x = rc.left; x < rc.right; x++) {
+                if (x >= 0 && x < bm->bitmap.width) row[x] = 0xFFFFFFFF;
+            }
+        }
+    }
+    for (int x = rc.left; x < rc.right; x++) {
+        if (x < 0 || x >= bm->bitmap.width) continue;
+        if (rc.top >= 0 && rc.top < bm->bitmap.height)
+            ((uint32_t *)(bm->bitmap.bits + rc.top * bm->bitmap.stride))[x] = c_tl_out;
+        if (rc.top + 1 >= 0 && rc.top + 1 < bm->bitmap.height)
+            ((uint32_t *)(bm->bitmap.bits + (rc.top + 1) * bm->bitmap.stride))[x] = c_tl_in;
+        if (rc.bottom - 2 >= 0 && rc.bottom - 2 < bm->bitmap.height)
+            ((uint32_t *)(bm->bitmap.bits + (rc.bottom - 2) * bm->bitmap.stride))[x] = c_br_in;
+        if (rc.bottom - 1 >= 0 && rc.bottom - 1 < bm->bitmap.height)
+            ((uint32_t *)(bm->bitmap.bits + (rc.bottom - 1) * bm->bitmap.stride))[x] = c_br_out;
+    }
+    for (int y = rc.top; y < rc.bottom; y++) {
+        if (y < 0 || y >= bm->bitmap.height) continue;
+        uint32_t *row = (uint32_t *)(bm->bitmap.bits + y * bm->bitmap.stride);
+        if (rc.left >= 0 && rc.left < bm->bitmap.width) row[rc.left] = c_tl_out;
+        if (rc.left + 1 >= 0 && rc.left + 1 < bm->bitmap.width) row[rc.left + 1] = c_tl_in;
+        if (rc.right - 2 >= 0 && rc.right - 2 < bm->bitmap.width) row[rc.right - 2] = c_br_in;
+        if (rc.right - 1 >= 0 && rc.right - 1 < bm->bitmap.width) row[rc.right - 1] = c_br_out;
+    }
+    if (grfFlags & 0x2000 /* BF_ADJUST */) {
+        rc.left += 2; rc.top += 2; rc.right -= 2; rc.bottom -= 2;
+        guest_mem_write(&proc->mem, qrc_va, &rc, sizeof(rc));
+    }
+    return 1;
+}
+
+static uint32_t u32_DrawFrameControl(win32_process_t *proc, uint32_t *args) {
+    H_HDC hdc = (H_HDC)args[0];
+    uint32_t lprc_va = args[1];
+    /* uint32_t uType = args[2]; */
+    uint32_t uState = args[3];
+    uint32_t edge = (uState & 0x0200 /* DFCS_PUSHED */) ? 0x000A /* EDGE_SUNKEN */ : 0x0005 /* EDGE_RAISED */;
+    uint32_t flags = 0x000F /* BF_RECT */ | 0x0800 /* BF_MIDDLE */ | ((uState & 0x2000) ? 0x2000 : 0);
+    uint32_t edge_args[4] = { hdc, lprc_va, edge, flags };
+    return u32_DrawEdge(proc, edge_args);
+}
+
+static uint32_t u32_TrackPopupMenuEx(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t u32_GetClipboardData(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 0;
+}
+
+static uint32_t u32_CharNextA(win32_process_t *proc, uint32_t *args) {
+    uint32_t ptr = args[0];
+    if (!ptr) return 0;
+    uint8_t ch = 0;
+    guest_mem_read(&proc->mem, ptr, &ch, 1);
+    return ch ? (ptr + 1) : ptr;
+}
+
+static uint32_t u32_CharPrevA(win32_process_t *proc, uint32_t *args) {
+    uint32_t start = args[0];
+    uint32_t cur = args[1];
+    return (cur > start) ? (cur - 1) : start;
+}
+
+static uint32_t u32_GetCursorPos(win32_process_t *proc, uint32_t *args) {
+    uint32_t pt_va = args[0];
+    if (pt_va) guest_mem_write(&proc->mem, pt_va, &s_cursor_pos, sizeof(s_cursor_pos));
+    return 1;
+}
+
+static uint32_t u32_DrawTextW(win32_process_t *proc, uint32_t *args) {
+    H_HDC hdc = (H_HDC)args[0];
     uint32_t str_va = args[1];
     int len = (int)args[2];
     uint32_t rc_va = args[3];
+    uint32_t format = args[4];
     if (!str_va || !rc_va) return 0;
-    int32_t rc[4];
-    guest_mem_read(&proc->mem, rc_va, rc, 16);
+    WIN_RECT rc = {0};
+    guest_mem_read(&proc->mem, rc_va, &rc, sizeof(rc));
     if (len < 0) {
         uint16_t wch = 0;
         len = 0;
-        while (guest_mem_read(&proc->mem, str_va + len * 2, &wch, 2) && wch != 0 && len < 256) len++;
+        while (guest_mem_read(&proc->mem, str_va + len * 2, &wch, 2) && wch != 0 && len < 255) len++;
     }
-    return 16; /* height */
+    if (len > 255) len = 255;
+    uint16_t wbuf[256] = {0};
+    guest_mem_read(&proc->mem, str_va, wbuf, len * 2);
+
+    if (format & 0x0400 /* DT_CALCRECT */) {
+        rc.right = rc.left + len * 8;
+        rc.bottom = rc.top + 12;
+        guest_mem_write(&proc->mem, rc_va, &rc, sizeof(rc));
+        return 12;
+    }
+
+    gdi_dc_t *dc = gdi_get_dc(hdc);
+    if (!dc) return 12;
+    gdi_object_t *bm = gdi_get_obj((H_HANDLE)dc->selected_bitmap);
+    if (!bm || !bm->bitmap.bits) return 12;
+
+    int x = rc.left;
+    int y = rc.top;
+    if (format & 0x0001 /* DT_CENTER */) {
+        x = rc.left + ((rc.right - rc.left) - len * 8) / 2;
+    } else if (format & 0x0002 /* DT_RIGHT */) {
+        x = rc.right - len * 8;
+    }
+    if (format & 0x0004 /* DT_VCENTER */) {
+        y = rc.top + ((rc.bottom - rc.top) - 8) / 2;
+    }
+
+    for (int i = 0; i < len; i++) {
+        char ch = (char)(wbuf[i] & 0x7F);
+        if (ch < 32 || ch > 126) ch = ' ';
+        const uint8_t *glyph = GDI_FONT_8X8[ch - 32];
+        for (int gy = 0; gy < 8; gy++) {
+            int py = y + gy;
+            if (py < 0 || py >= bm->bitmap.height) continue;
+            uint8_t row = glyph[gy];
+            for (int gx = 0; gx < 8; gx++) {
+                int px = x + (i * 8) + gx;
+                if (px < 0 || px >= bm->bitmap.width) continue;
+                if (row & (0x80 >> gx)) {
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->text_color | 0xFF000000;
+                } else if (dc->bk_mode == 2) {
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->bk_color | 0xFF000000;
+                }
+            }
+        }
+    }
+    return 12;
+}
+
+static uint32_t u32_DrawTextA(win32_process_t *proc, uint32_t *args) {
+    H_HDC hdc = (H_HDC)args[0];
+    uint32_t str_va = args[1];
+    int len = (int)args[2];
+    uint32_t rc_va = args[3];
+    uint32_t format = args[4];
+    if (!str_va || !rc_va) return 0;
+    const char *str = (const char *)guest_va_to_host(&proc->mem, str_va);
+    if (!str) return 0;
+    if (len < 0) len = (int)strlen(str);
+    if (len > 255) len = 255;
+
+    WIN_RECT rc = {0};
+    guest_mem_read(&proc->mem, rc_va, &rc, sizeof(rc));
+    if (format & 0x0400 /* DT_CALCRECT */) {
+        rc.right = rc.left + len * 8;
+        rc.bottom = rc.top + 12;
+        guest_mem_write(&proc->mem, rc_va, &rc, sizeof(rc));
+        return 12;
+    }
+
+    gdi_dc_t *dc = gdi_get_dc(hdc);
+    if (!dc) return 12;
+    gdi_object_t *bm = gdi_get_obj((H_HANDLE)dc->selected_bitmap);
+    if (!bm || !bm->bitmap.bits) return 12;
+
+    int x = rc.left;
+    int y = rc.top;
+    if (format & 0x0001 /* DT_CENTER */) {
+        x = rc.left + ((rc.right - rc.left) - len * 8) / 2;
+    } else if (format & 0x0002 /* DT_RIGHT */) {
+        x = rc.right - len * 8;
+    }
+    if (format & 0x0004 /* DT_VCENTER */) {
+        y = rc.top + ((rc.bottom - rc.top) - 8) / 2;
+    }
+
+    for (int i = 0; i < len; i++) {
+        char ch = str[i];
+        if (ch < 32 || ch > 126) ch = ' ';
+        const uint8_t *glyph = GDI_FONT_8X8[ch - 32];
+        for (int gy = 0; gy < 8; gy++) {
+            int py = y + gy;
+            if (py < 0 || py >= bm->bitmap.height) continue;
+            uint8_t row = glyph[gy];
+            for (int gx = 0; gx < 8; gx++) {
+                int px = x + (i * 8) + gx;
+                if (px < 0 || px >= bm->bitmap.width) continue;
+                if (row & (0x80 >> gx)) {
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->text_color | 0xFF000000;
+                } else if (dc->bk_mode == 2) {
+                    *(uint32_t *)(bm->bitmap.bits + (py * bm->bitmap.stride) + (px * 4)) = dc->bk_color | 0xFF000000;
+                }
+            }
+        }
+    }
+    return 12;
 }
 
 void user32_init_apis(void) {
@@ -2531,12 +4050,9 @@ void user32_init_apis(void) {
     win32_register_api("USER32.DLL", "DestroyWindow", 0, u32_DestroyWindow, 1);
 
     win32_register_api("USER32.DLL", "GetMessageA", 0, u32_GetMessageA, 4);
-    win32_register_api("USER32.DLL", "GetMessageW", 0, u32_GetMessageA, 4);
     win32_register_api("USER32.DLL", "PeekMessageA", 0, u32_PeekMessageA, 5);
-    win32_register_api("USER32.DLL", "PeekMessageW", 0, u32_PeekMessageA, 5);
     win32_register_api("USER32.DLL", "TranslateMessage", 0, u32_TranslateMessage, 1);
     win32_register_api("USER32.DLL", "DispatchMessageA", 0, u32_DispatchMessageA, 1);
-    win32_register_api("USER32.DLL", "DispatchMessageW", 0, u32_DispatchMessageA, 1);
     win32_register_api("USER32.DLL", "PostQuitMessage", 0, u32_PostQuitMessage, 1);
     win32_register_api("USER32.DLL", "PostMessageA", 0, u32_PostMessage, 4);
     win32_register_api("USER32.DLL", "PostMessageW", 0, u32_PostMessage, 4);
@@ -2552,10 +4068,41 @@ void user32_init_apis(void) {
 
     win32_register_api("USER32.DLL", "LoadStringW", 0, u32_LoadStringW, 4);
     win32_register_api("USER32.DLL", "LoadIconW", 0, u32_dummy_handle, 2);
+    win32_register_api("USER32.DLL", "LoadIconA", 0, u32_dummy_handle, 2);
     win32_register_api("USER32.DLL", "LoadCursorW", 0, u32_dummy_handle, 2);
+    win32_register_api("USER32.DLL", "LoadCursorA", 0, u32_dummy_handle, 2);
     win32_register_api("USER32.DLL", "LoadMenuW", 0, u32_LoadMenuW, 2);
-    win32_register_api("USER32.DLL", "LoadMenuA", 0, u32_LoadMenuW, 2);
+    win32_register_api("USER32.DLL", "LoadMenuA", 0, u32_LoadMenuA, 2);
+    win32_register_api("USER32.DLL", "CallWindowProcW", 0, u32_CallWindowProcW, 5);
+    win32_register_api("USER32.DLL", "CallWindowProcA", 0, u32_CallWindowProcW, 5);
+    win32_register_api("USER32.DLL", "GetWindowLongA", 0, u32_GetWindowLongW, 2);
+    win32_register_api("USER32.DLL", "SetWindowLongA", 0, u32_SetWindowLongW, 3);
     win32_register_api("USER32.DLL", "LoadAcceleratorsW", 0, u32_dummy_handle, 2);
+    win32_register_api("USER32.DLL", "LoadAcceleratorsA", 0, u32_dummy_handle, 2);
+    win32_register_api("USER32.DLL", "TranslateAcceleratorA", 0, u32_TranslateAcceleratorW, 3);
+    win32_register_api("USER32.DLL", "IsDialogMessageA", 0, u32_IsDialogMessageW, 2);
+    win32_register_api("USER32.DLL", "GetWindowRect", 0, u32_GetWindowRect, 2);
+    win32_register_api("USER32.DLL", "ScreenToClient", 0, u32_ScreenToClient, 2);
+    win32_register_api("USER32.DLL", "MapDialogRect", 0, u32_MapDialogRect, 2);
+    win32_register_api("USER32.DLL", "GetSysColorBrush", 0, u32_GetSysColorBrush, 1);
+    win32_register_api("USER32.DLL", "CharUpperA", 0, u32_CharUpperA, 1);
+    win32_register_api("USER32.DLL", "CharNextA", 0, u32_CharNextA, 1);
+    win32_register_api("USER32.DLL", "CharPrevA", 0, u32_CharPrevA, 2);
+    win32_register_api("USER32.DLL", "RegisterWindowMessageA", 0, u32_RegisterWindowMessageW, 1);
+    win32_register_api("USER32.DLL", "TabbedTextOutA", 0, u32_DrawTextW, 8);
+    win32_register_api("USER32.DLL", "ChildWindowFromPoint", 0, u32_SetFocus, 3);
+    win32_register_api("USER32.DLL", "GetCursorPos", 0, u32_GetCursorPos, 1);
+    win32_register_api("USER32.DLL", "GetLastActivePopup", 0, u32_SetFocus, 1);
+    win32_register_api("USER32.DLL", "SetForegroundWindow", 0, u32_SetFocus, 1);
+    win32_register_api("SHELL32.DLL", "DragAcceptFiles", 0, dummy_PlaySoundW, 2);
+    win32_register_api("SHELL32.DLL", "DragFinish", 0, dummy_PlaySoundW, 1);
+    win32_register_api("SHELL32.DLL", "DragQueryFileA", 0, u32_IsDialogMessageW, 4);
+    win32_register_api("SHELL32.DLL", "ShellExecuteA", 0, dummy_PlaySoundW, 6);
+    win32_register_api("SHELL32.DLL", "ShellAboutA", 0, dummy_ShellAboutW, 4);
+    win32_register_api("USER32.DLL", "DrawEdge", 0, u32_DrawEdge, 4);
+    win32_register_api("USER32.DLL", "DrawFrameControl", 0, u32_DrawFrameControl, 4);
+    win32_register_api("USER32.DLL", "TrackPopupMenuEx", 0, u32_TrackPopupMenuEx, 6);
+    win32_register_api("USER32.DLL", "GetClipboardData", 0, u32_GetClipboardData, 1);
     win32_register_api("USER32.DLL", "GetSystemMetrics", 0, u32_GetSystemMetrics, 1);
     win32_register_api("USER32.DLL", "GetDesktopWindow", 0, u32_GetDesktopWindow, 0);
     win32_register_api("USER32.DLL", "GetMenuItemRect", 0, u32_GetMenuItemRect, 4);
@@ -2581,6 +4128,11 @@ void user32_init_apis(void) {
     win32_register_api("USER32.DLL", "InvalidateRect", 0, u32_InvalidateRect, 3);
     win32_register_api("USER32.DLL", "SetRect", 0, u32_SetRect, 5);
     win32_register_api("USER32.DLL", "DialogBoxParamW", 0, u32_DialogBoxParamW, 5);
+    win32_register_api("USER32.DLL", "DialogBoxParamA", 0, u32_DialogBoxParamA, 5);
+    win32_register_api("USER32.DLL", "CreateDialogParamW", 0, u32_CreateDialogParamW, 5);
+    win32_register_api("USER32.DLL", "CreateDialogParamA", 0, u32_CreateDialogParamA, 5);
+    win32_register_api("USER32.DLL", "CreateDialogIndirectParamW", 0, u32_CreateDialogIndirectParamW, 5);
+    win32_register_api("USER32.DLL", "CreateDialogIndirectParamA", 0, u32_CreateDialogIndirectParamA, 5);
     win32_register_api("USER32.DLL", "TranslateAcceleratorW", 0, u32_TranslateAcceleratorW, 3);
 
     win32_register_api("USER32.DLL", "DefFrameProcW", 0, u32_DefFrameProcW, 5);
@@ -2608,7 +4160,7 @@ void user32_init_apis(void) {
     win32_register_api("USER32.DLL", "IsDlgButtonChecked", 0, u32_IsDlgButtonChecked, 2);
     win32_register_api("USER32.DLL", "CheckRadioButton", 0, u32_CheckRadioButton, 4);
     win32_register_api("USER32.DLL", "SendDlgItemMessageA", 0, u32_SendDlgItemMessageA, 5);
-    win32_register_api("USER32.DLL", "SendDlgItemMessageW", 0, u32_SendDlgItemMessageA, 5);
+    win32_register_api("USER32.DLL", "SendDlgItemMessageW", 0, u32_SendDlgItemMessageW, 5);
     win32_register_api("USER32.DLL", "SetDlgItemTextA", 0, u32_SetDlgItemTextA, 3);
     win32_register_api("USER32.DLL", "GetDlgItemTextA", 0, u32_GetDlgItemTextA, 4);
     win32_register_api("USER32.DLL", "WinHelpA", 0, u32_WinHelpW, 4);
@@ -2637,6 +4189,7 @@ void user32_init_apis(void) {
     win32_register_api("USER32.DLL", "SetCursorPos", 0, u32_SetCursorPos, 2);
     win32_register_api("USER32.DLL", "MsgWaitForMultipleObjects", 0, u32_MsgWaitForMultipleObjects, 5);
     win32_register_api("USER32.DLL", "DrawTextW", 0, u32_DrawTextW, 5);
+    win32_register_api("USER32.DLL", "DrawTextA", 0, u32_DrawTextA, 5);
 
     win32_register_api("USER32.DLL", "CharUpperW", 0, u32_CharUpperW, 1);
     win32_register_api("USER32.DLL", "CharNextW", 0, u32_CharNextW, 1);

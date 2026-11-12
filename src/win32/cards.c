@@ -29,8 +29,8 @@ static void draw_card_surface(gdi_object_t *bm, int cx, int cy, int cw, int ch, 
     int bw = bm->bitmap.width;
     int bh = bm->bitmap.height;
 
-    /* Mode 4 = empty slot outline (tableau/foundation placeholder) */
-    if (mode == 4 || card == 0xFF) {
+    /* Mode 3 (mdGhost) or Mode 4 (mdOGhost) = empty slot outline (tableau/foundation placeholder) */
+    if (mode == 3 || mode == 4 || card == 0xFF) {
         for (int y = 0; y < ch; y++) {
             int py = cy + y;
             if (py < 0 || py >= bh) continue;

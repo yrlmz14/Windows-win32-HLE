@@ -29,10 +29,23 @@ static void sig_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    /* Ensure working directory is the executable's directory if relative paths like apps/... are used */
+    if (argc > 0 && argv[0] && access("apps", F_OK) != 0) {
+        char exe_dir[512] = {0};
+        strncpy(exe_dir, argv[0], sizeof(exe_dir) - 1);
+        char *last_s = strrchr(exe_dir, '/');
+        char *last_b = strrchr(exe_dir, '\\');
+        char *sep = last_s > last_b ? last_s : last_b;
+        if (sep) {
+            *sep = '\0';
+            chdir(exe_dir);
+        }
+    }
 
     LOGI("=================================================================");
     LOGI("Kindle Paperwhite 5 Win32 HLE Engine & Retro Desktop");
@@ -100,6 +113,52 @@ int main(int argc, char **argv) {
         if (touch_take_dirty()) {
             screen_dirty = true;
         }
+        if (frame_count == 15) {
+            const char *sim_keys = getenv("SIM_KEYS");
+            if (sim_keys) {
+                for (int k = 0; sim_keys[k]; k++) {
+                    user_inject_key(0, sim_keys[k], true);
+                }
+                screen_dirty = true;
+            }
+            const char *sim_click = getenv("SIM_CLICK");
+            if (sim_click) {
+                int cx = 0, cy = 0;
+                if (sscanf(sim_click, "%d,%d", &cx, &cy) == 2) {
+                    if (!desktop_shell_handle_tap(cx, cy)) {
+                        user_inject_mouse_down(cx, cy, false);
+                        user_inject_mouse_up(cx, cy, false);
+                    }
+                    screen_dirty = true;
+                }
+            }
+        }
+        if (frame_count == 25) {
+            const char *sim_click2 = getenv("SIM_CLICK2");
+            if (sim_click2) {
+                int cx = 0, cy = 0;
+                if (sscanf(sim_click2, "%d,%d", &cx, &cy) == 2) {
+                    if (!desktop_shell_handle_tap(cx, cy)) {
+                        user_inject_mouse_down(cx, cy, false);
+                        user_inject_mouse_up(cx, cy, false);
+                    }
+                    screen_dirty = true;
+                }
+            }
+        }
+        if (frame_count == 35) {
+            const char *sim_click3 = getenv("SIM_CLICK3");
+            if (sim_click3) {
+                int cx = 0, cy = 0;
+                if (sscanf(sim_click3, "%d,%d", &cx, &cy) == 2) {
+                    if (!desktop_shell_handle_tap(cx, cy)) {
+                        user_inject_mouse_down(cx, cy, false);
+                        user_inject_mouse_up(cx, cy, false);
+                    }
+                    screen_dirty = true;
+                }
+            }
+        }
 
         /* Step 3D logo rotation animation when menu is open */
         if (desktop_shell_is_menu_open()) {
@@ -155,6 +214,14 @@ int main(int argc, char **argv) {
             /* Present to E-Ink Display / Simulator */
             int refresh_mode = (frame_count == 1 || frame_count % 300 == 0) ? EINK_REFRESH_FULL : EINK_REFRESH_FAST;
             eink_present(refresh_mode);
+        }
+
+        const char *exit_frames_env = getenv("SIM_EXIT_FRAMES");
+        if (exit_frames_env && exit_frames_env[0]) {
+            uint64_t max_frames = (uint64_t)atoi(exit_frames_env);
+            if (max_frames > 0 && frame_count >= max_frames) {
+                break;
+            }
         }
 
         /* Yield CPU briefly for ~35-40 FPS UI loop */

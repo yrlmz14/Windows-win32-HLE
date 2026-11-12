@@ -5,8 +5,8 @@
 #include "../pe_loader.h"
 #include "win32_types.h"
 
-#define GDI_MAX_DCS     32
-#define GDI_MAX_OBJS    256
+#define GDI_MAX_DCS     128
+#define GDI_MAX_OBJS    1024
 
 typedef enum {
     GDI_OBJ_NONE = 0,
@@ -36,6 +36,7 @@ typedef struct {
             int stride;
             uint8_t *bits;
             bool is_dib;
+            bool is_window_fb;
             WIN_RGBQUAD palette[256];
         } bitmap;
         struct {

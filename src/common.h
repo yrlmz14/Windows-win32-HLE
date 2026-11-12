@@ -32,9 +32,9 @@
 /* Logging macros */
 void win32_app_request_load(const char *path);
 #define LOG_TAG "kindle_win32"
-#define LOGI(fmt, ...) do { printf("[INFO][%s] " fmt "\n", LOG_TAG, ##__VA_ARGS__); fflush(stdout); } while (0)
-#define LOGW(fmt, ...) do { printf("[WARN][%s] " fmt "\n", LOG_TAG, ##__VA_ARGS__); fflush(stdout); } while (0)
-#define LOGE(fmt, ...) do { fprintf(stderr, "[ERR ][%s] " fmt "\n", LOG_TAG, ##__VA_ARGS__); fflush(stderr); } while (0)
+#define LOGI(fmt, ...) printf("[INFO][%s] " fmt "\n", LOG_TAG, ##__VA_ARGS__)
+#define LOGW(fmt, ...) printf("[WARN][%s] " fmt "\n", LOG_TAG, ##__VA_ARGS__)
+#define LOGE(fmt, ...) fprintf(stderr, "[ERR ][%s] " fmt "\n", LOG_TAG, ##__VA_ARGS__)
 #ifdef DEBUG_WIN32
 #define LOGD(fmt, ...) printf("[DBG ][%s] " fmt "\n", LOG_TAG, ##__VA_ARGS__)
 #else

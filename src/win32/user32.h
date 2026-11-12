@@ -5,9 +5,17 @@
 #include "../pe_loader.h"
 #include "win32_types.h"
 
-#define MAX_WINDOWS     32
+#define MAX_WINDOWS     64
 #define MAX_CLASSES     32
 #define MSG_QUEUE_CAP   64
+
+#define BUILTIN_WNDPROC_BUTTON    0xFE010001U
+#define BUILTIN_WNDPROC_EDIT      0xFE010002U
+#define BUILTIN_WNDPROC_STATIC    0xFE010003U
+#define BUILTIN_WNDPROC_LISTBOX   0xFE010004U
+#define BUILTIN_WNDPROC_COMBOBOX  0xFE010005U
+#define BUILTIN_WNDPROC_STATUSBAR 0xFE010006U
+#define BUILTIN_WNDPROC_SCROLLBAR 0xFE010007U
 
 typedef struct {
     char class_name[64];
@@ -15,6 +23,8 @@ typedef struct {
     H_HICON   icon;
     H_HCURSOR cursor;
     H_HBRUSH  background_brush;
+    uint32_t  menu_id;
+    char      menu_name[64];
 } win32_class_t;
 
 typedef struct {
@@ -39,6 +49,24 @@ typedef struct {
     uint32_t extra_bytes[16];
     bool minimized;
     bool maximized;
+    /* Built-in Edit control state */
+    char *edit_buf;
+    int edit_cap;
+    int edit_len;
+    int edit_caret;
+    int edit_sel_start;
+    int edit_sel_end;
+    bool edit_modified;
+    uint32_t edit_guest_handle;
+    /* Built-in Button control state */
+    int btn_check_state;
+    bool btn_pressed;
+    /* Built-in StatusBar (msctls_statusbar32) state */
+    int sb_part_count;
+    int sb_parts[16];
+    char sb_texts[16][128];
+    bool sb_simple;
+    char sb_simple_text[128];
 } win32_window_t;
 
 void user32_init(void);

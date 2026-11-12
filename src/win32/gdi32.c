@@ -291,7 +291,7 @@ static uint32_t gdi_SelectObject(win32_process_t *proc, uint32_t *args) {
         default:
             break;
     }
-    return (uint32_t)prev;
+    return prev ? (uint32_t)prev : (uint32_t)hobj;
 }
 
 static uint32_t gdi_DeleteObject(win32_process_t *proc, uint32_t *args) {
@@ -299,7 +299,7 @@ static uint32_t gdi_DeleteObject(win32_process_t *proc, uint32_t *args) {
     H_HANDLE h = (H_HANDLE)args[0];
     gdi_object_t *obj = gdi_get_obj(h);
     if (obj) {
-        if (obj->type == GDI_OBJ_BITMAP && obj->bitmap.bits) {
+        if (obj->type == GDI_OBJ_BITMAP && obj->bitmap.bits && !obj->bitmap.is_window_fb) {
             free(obj->bitmap.bits);
             obj->bitmap.bits = NULL;
         }
@@ -309,55 +309,63 @@ static uint32_t gdi_DeleteObject(win32_process_t *proc, uint32_t *args) {
     return 0;
 }
 
+static H_HANDLE s_stock_objs[32] = {0};
+
 static uint32_t gdi_GetStockObject(win32_process_t *proc, uint32_t *args) {
     (void)proc;
     uint32_t obj = args[0];
+    if (obj < 32 && s_stock_objs[obj]) {
+        return (uint32_t)s_stock_objs[obj];
+    }
     H_HANDLE h = 0;
     switch (obj) {
         case 0: /* WHITE_BRUSH */
             h = alloc_gdi_obj(GDI_OBJ_BRUSH);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->brush.color = 0x00FFFFFF; o->brush.style = 0; }
-            return (uint32_t)h;
+            break;
         case 1: /* LTGRAY_BRUSH */
             h = alloc_gdi_obj(GDI_OBJ_BRUSH);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->brush.color = 0x00C0C0C0; o->brush.style = 0; }
-            return (uint32_t)h;
+            break;
         case 2: /* GRAY_BRUSH */
             h = alloc_gdi_obj(GDI_OBJ_BRUSH);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->brush.color = 0x00808080; o->brush.style = 0; }
-            return (uint32_t)h;
+            break;
         case 3: /* DKGRAY_BRUSH */
             h = alloc_gdi_obj(GDI_OBJ_BRUSH);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->brush.color = 0x00404040; o->brush.style = 0; }
-            return (uint32_t)h;
+            break;
         case 4: /* BLACK_BRUSH */
             h = alloc_gdi_obj(GDI_OBJ_BRUSH);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->brush.color = 0x00000000; o->brush.style = 0; }
-            return (uint32_t)h;
+            break;
         case 5: /* NULL_BRUSH / HOLLOW_BRUSH */
             h = alloc_gdi_obj(GDI_OBJ_BRUSH);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->brush.color = 0x00FFFFFF; o->brush.style = 1; }
-            return (uint32_t)h;
+            break;
         case 6: /* WHITE_PEN */
             h = alloc_gdi_obj(GDI_OBJ_PEN);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->pen.color = 0x00FFFFFF; o->pen.width = 1; }
-            return (uint32_t)h;
+            break;
         case 7: /* BLACK_PEN */
             h = alloc_gdi_obj(GDI_OBJ_PEN);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->pen.color = 0x00000000; o->pen.width = 1; }
-            return (uint32_t)h;
+            break;
         case 8: /* NULL_PEN */
             h = alloc_gdi_obj(GDI_OBJ_PEN);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->pen.color = 0x00000000; o->pen.width = 0; }
-            return (uint32_t)h;
+            break;
         case 13: /* SYSTEM_FONT */
         case 17: /* DEFAULT_GUI_FONT */
-            return (uint32_t)alloc_gdi_obj(GDI_OBJ_FONT);
+            h = alloc_gdi_obj(GDI_OBJ_FONT);
+            break;
         default:
             h = alloc_gdi_obj(GDI_OBJ_BRUSH);
             if (h) { gdi_object_t *o = gdi_get_obj(h); o->brush.color = 0x00C0C0C0; o->brush.style = 0; }
-            return (uint32_t)h;
+            break;
     }
+    if (obj < 32) s_stock_objs[obj] = h;
+    return (uint32_t)h;
 }
 
 /* Drawing Blits & Primitives */
@@ -715,9 +723,13 @@ static uint32_t gdi_GetDeviceCaps(win32_process_t *proc, uint32_t *args) {
         case 10: return DEFAULT_SCREEN_H; /* VERTRES */
         case 12: return 32;               /* BITSPIXEL */
         case 14: return 1;                /* PLANES */
-        case 88: return 300;              /* LOGPIXELSX (Kindle PW5 300 PPI) */
-        case 90: return 300;              /* LOGPIXELSY */
-        default: return 0;
+        case 24: return -1;               /* NUMCOLORS */
+        case 36: return 72;               /* ASPECTX */
+        case 38: return 72;               /* ASPECTY */
+        case 40: return 102;              /* ASPECTXY */
+        case 88: return 96;               /* LOGPIXELSX */
+        case 90: return 96;               /* LOGPIXELSY */
+        default: return 1;
     }
 }
 
@@ -761,6 +773,21 @@ static uint32_t gdi_PtVisible(win32_process_t *proc, uint32_t *args) {
 
 static uint32_t gdi_SetBrushOrgEx(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
+    return 1;
+}
+
+static uint32_t gdi_GetTextMetricsA(win32_process_t *proc, uint32_t *args) {
+    uint32_t tm_va = args[1];
+    if (tm_va) {
+        uint8_t tm_buf[56] = {0};
+        int32_t h = 16, asc = 13, desc = 3, avg_w = 8, max_w = 8;
+        memcpy(tm_buf + 0, &h, 4);
+        memcpy(tm_buf + 4, &asc, 4);
+        memcpy(tm_buf + 8, &desc, 4);
+        memcpy(tm_buf + 20, &avg_w, 4);
+        memcpy(tm_buf + 24, &max_w, 4);
+        guest_mem_write(&proc->mem, tm_va, tm_buf, sizeof(tm_buf));
+    }
     return 1;
 }
 
@@ -862,7 +889,14 @@ static uint32_t gdi_dummy_success(win32_process_t *proc, uint32_t *args) {
 
 void gdi32_init(void) {
     memset(s_dcs, 0, sizeof(s_dcs));
+    for (int i = 1; i < GDI_MAX_OBJS; i++) {
+        if (s_objs[i].type == GDI_OBJ_BITMAP && s_objs[i].bitmap.bits && !s_objs[i].bitmap.is_window_fb) {
+            free(s_objs[i].bitmap.bits);
+            s_objs[i].bitmap.bits = NULL;
+        }
+    }
     memset(s_objs, 0, sizeof(s_objs));
+    memset(s_stock_objs, 0, sizeof(s_stock_objs));
 
     win32_register_api("GDI32.DLL", "GetObjectW", 0, gdi_GetObjectW, 3);
     win32_register_api("GDI32.DLL", "GetObjectA", 0, gdi_GetObjectW, 3);
@@ -882,10 +916,20 @@ void gdi32_init(void) {
     win32_register_api("GDI32.DLL", "TextOutA", 0, gdi_TextOutA, 5);
     win32_register_api("GDI32.DLL", "TextOutW", 0, gdi_TextOutW, 5);
     win32_register_api("GDI32.DLL", "CreateFontW", 0, gdi_CreateFontW, 14);
+    win32_register_api("GDI32.DLL", "CreateFontA", 0, gdi_CreateFontW, 14);
     win32_register_api("GDI32.DLL", "CreateFontIndirectW", 0, gdi_CreateFontIndirectW, 1);
+    win32_register_api("GDI32.DLL", "CreateFontIndirectA", 0, gdi_CreateFontIndirectW, 1);
     win32_register_api("GDI32.DLL", "GetTextFaceW", 0, gdi_GetTextFaceW, 3);
+    win32_register_api("GDI32.DLL", "GetTextFaceA", 0, gdi_GetTextFaceW, 3);
+    win32_register_api("GDI32.DLL", "GetTextCharset", 0, gdi_dummy_success, 1);
+    win32_register_api("GDI32.DLL", "StartDocA", 0, gdi_dummy_success, 2);
+    win32_register_api("GDI32.DLL", "CreateDCA", 0, gdi_CreateCompatibleDC, 4);
     win32_register_api("GDI32.DLL", "GetTextExtentPoint32W", 0, gdi_GetTextExtentPoint32W, 4);
+    win32_register_api("GDI32.DLL", "GetTextExtentPoint32A", 0, gdi_GetTextExtentPoint32W, 4);
+    win32_register_api("GDI32.DLL", "GetTextExtentPointW", 0, gdi_GetTextExtentPoint32W, 4);
+    win32_register_api("GDI32.DLL", "GetTextExtentPointA", 0, gdi_GetTextExtentPoint32W, 4);
     win32_register_api("GDI32.DLL", "GetTextMetricsW", 0, gdi_GetTextMetricsW, 2);
+    win32_register_api("GDI32.DLL", "GetTextMetricsA", 0, gdi_GetTextMetricsA, 2);
     win32_register_api("GDI32.DLL", "PtVisible", 0, gdi_PtVisible, 3);
     win32_register_api("GDI32.DLL", "SetBrushOrgEx", 0, gdi_SetBrushOrgEx, 4);
     win32_register_api("GDI32.DLL", "LineDDA", 0, gdi_LineDDA, 6);

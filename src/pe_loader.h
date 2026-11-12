@@ -127,6 +127,9 @@ typedef struct {
     uint32_t       size_of_image;
     uint32_t       rsrc_rva;
     uint32_t       rsrc_size;
+    uint32_t       mui_base;
+    uint32_t       mui_rsrc_rva;
+    uint32_t       mui_rsrc_size;
     uint32_t       stack_top;
     uint32_t       stack_base;
     uint32_t       heap_current;
@@ -150,6 +153,7 @@ bool pe_load_file(win32_process_t *proc, const char *filepath);
 bool pe_load_buffer(win32_process_t *proc, const uint8_t *buf, size_t buf_size);
 int pe_load_resource_string(const win32_process_t *proc, uint32_t string_id, uint16_t *out_str, int max_chars);
 uint32_t pe_find_resource_data(const win32_process_t *proc, uint32_t type_id, uint32_t name_id, uint32_t *out_size);
+uint32_t pe_find_resource_ex(const win32_process_t *proc, uint32_t type_id, uint32_t name_or_id, bool is_unicode, uint32_t *out_size);
 bool pe_extract_icon_file(const char *filepath, int icon_index, uint32_t *out_argb32);
 
 /* Memory Read/Write Helpers for CPU */

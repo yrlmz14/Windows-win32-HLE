@@ -26,6 +26,27 @@ static uint32_t adv_RegOpenKeyExA(win32_process_t *proc, uint32_t *args) {
     return 0; /* ERROR_SUCCESS */
 }
 
+static uint32_t adv_RegOpenKeyExW(win32_process_t *proc, uint32_t *args) {
+    uint32_t phkResult = args[4];
+    if (phkResult) {
+        x86_mem_write32(&proc->cpu, phkResult, 0x00000001);
+    }
+    return 0; /* ERROR_SUCCESS */
+}
+
+static uint32_t adv_RegCreateKeyW(win32_process_t *proc, uint32_t *args) {
+    uint32_t phkResult = args[2];
+    if (phkResult) {
+        x86_mem_write32(&proc->cpu, phkResult, 0x00000001);
+    }
+    return 0; /* ERROR_SUCCESS */
+}
+
+static uint32_t adv_RegGetValueW(win32_process_t *proc, uint32_t *args) {
+    (void)proc; (void)args;
+    return 2; /* ERROR_FILE_NOT_FOUND */
+}
+
 static uint32_t adv_RegCreateKeyExA(win32_process_t *proc, uint32_t *args) {
     uint32_t phkResult = args[7];
     if (phkResult) {
@@ -195,7 +216,12 @@ static uint32_t adv_RegSetValueExW(win32_process_t *proc, uint32_t *args) {
 }
 
 void advapi32_init(void) {
+    s_reg_count = 0;
+    memset(s_reg, 0, sizeof(s_reg));
     win32_register_api("ADVAPI32.DLL", "RegOpenKeyExA", 0, adv_RegOpenKeyExA, 5);
+    win32_register_api("ADVAPI32.DLL", "RegOpenKeyExW", 0, adv_RegOpenKeyExW, 5);
+    win32_register_api("ADVAPI32.DLL", "RegCreateKeyW", 0, adv_RegCreateKeyW, 3);
+    win32_register_api("ADVAPI32.DLL", "RegGetValueW", 0, adv_RegGetValueW, 7);
     win32_register_api("ADVAPI32.DLL", "RegCreateKeyExA", 0, adv_RegCreateKeyExA, 9);
     win32_register_api("ADVAPI32.DLL", "RegCreateKeyExW", 0, adv_RegCreateKeyExW, 9);
     win32_register_api("ADVAPI32.DLL", "RegQueryValueExA", 0, adv_RegQueryValueExA, 6);

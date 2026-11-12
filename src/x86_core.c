@@ -2055,6 +2055,233 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
             return true;
         }
 
+        /* MOV r16, imm16 (0x66 0xB8+r) */
+        if (op2 >= 0xB8 && op2 <= 0xBF) {
+            uint8_t r = op2 - 0xB8;
+            uint16_t imm = (uint16_t)code[2] | ((uint16_t)code[3] << 8);
+            gprs[r] = (gprs[r] & ~0xFFFFU) | imm;
+            ctx->regs.eip += 4;
+            return true;
+        }
+
+        /* INC r16 (0x66 0x40+r) */
+        if (op2 >= 0x40 && op2 <= 0x47) {
+            uint8_t r = op2 - 0x40;
+            uint16_t val = (uint16_t)((gprs[r] + 1) & 0xFFFF);
+            gprs[r] = (gprs[r] & ~0xFFFFU) | val;
+            ctx->regs.eflags &= ~(X86_EFLAGS_ZF | X86_EFLAGS_SF | X86_EFLAGS_OF);
+            if (val == 0) ctx->regs.eflags |= X86_EFLAGS_ZF;
+            if (val & 0x8000) ctx->regs.eflags |= X86_EFLAGS_SF;
+            if (val == 0x8000) ctx->regs.eflags |= X86_EFLAGS_OF;
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* DEC r16 (0x66 0x48+r) */
+        if (op2 >= 0x48 && op2 <= 0x4F) {
+            uint8_t r = op2 - 0x48;
+            uint16_t val = (uint16_t)((gprs[r] - 1) & 0xFFFF);
+            gprs[r] = (gprs[r] & ~0xFFFFU) | val;
+            ctx->regs.eflags &= ~(X86_EFLAGS_ZF | X86_EFLAGS_SF | X86_EFLAGS_OF);
+            if (val == 0) ctx->regs.eflags |= X86_EFLAGS_ZF;
+            if (val & 0x8000) ctx->regs.eflags |= X86_EFLAGS_SF;
+            if (val == 0x7FFF) ctx->regs.eflags |= X86_EFLAGS_OF;
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* PUSH r16 (0x66 0x50+r) */
+        if (op2 >= 0x50 && op2 <= 0x57) {
+            uint8_t r = op2 - 0x50;
+            uint16_t val = (uint16_t)(gprs[r] & 0xFFFF);
+            ctx->regs.esp -= 2;
+            x86_mem_write16(ctx, ctx->regs.esp, val);
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* POP r16 (0x66 0x58+r) */
+        if (op2 >= 0x58 && op2 <= 0x5F) {
+            uint8_t r = op2 - 0x58;
+            uint16_t val = 0;
+            x86_mem_read16(ctx, ctx->regs.esp, &val);
+            ctx->regs.esp += 2;
+            gprs[r] = (gprs[r] & ~0xFFFFU) | val;
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* XCHG AX, r16 (0x66 0x91..0x97) */
+        if (op2 >= 0x91 && op2 <= 0x97) {
+            uint8_t r = op2 - 0x90;
+            uint16_t tmp = (uint16_t)(gprs[0] & 0xFFFF);
+            gprs[0] = (gprs[0] & ~0xFFFFU) | (gprs[r] & 0xFFFFU);
+            gprs[r] = (gprs[r] & ~0xFFFFU) | tmp;
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* CBW (0x66 0x98): AX = sign-extend AL */
+        if (op2 == 0x98) {
+            int16_t sx = (int16_t)(int8_t)(ctx->regs.eax & 0xFF);
+            ctx->regs.eax = (ctx->regs.eax & ~0xFFFFU) | ((uint16_t)sx & 0xFFFFU);
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* CWD (0x66 0x99): DX:AX = sign-extend AX */
+        if (op2 == 0x99) {
+            uint16_t dx = (ctx->regs.eax & 0x8000) ? 0xFFFF : 0x0000;
+            ctx->regs.edx = (ctx->regs.edx & ~0xFFFFU) | dx;
+            ctx->regs.eip += 2;
+            return true;
+        }
+
+        /* ADD/OR/ADC/SBB/AND/SUB/XOR/CMP AX, imm16 (0x66 0x05/0D/15/1D/25/2D/35) */
+        if (op2 == 0x05 || op2 == 0x0D || op2 == 0x15 || op2 == 0x1D ||
+            op2 == 0x25 || op2 == 0x2D || op2 == 0x35) {
+            uint16_t imm = (uint16_t)code[2] | ((uint16_t)code[3] << 8);
+            uint16_t a = (uint16_t)(ctx->regs.eax & 0xFFFF);
+            uint32_t res = exec_group1(ctx, (op2 >> 3) & 7, a, imm, true);
+            ctx->regs.eax = (ctx->regs.eax & ~0xFFFFU) | (res & 0xFFFFU);
+            ctx->regs.eip += 4;
+            return true;
+        }
+
+        /* ADD/OR/ADC/SBB/AND/SUB r/m16, r16 or r16, r/m16 (0x66 0x01/03/11/13/19/1B/29/2B) */
+        if (op2 == 0x01 || op2 == 0x03 || op2 == 0x11 || op2 == 0x13 ||
+            op2 == 0x19 || op2 == 0x1B || op2 == 0x29 || op2 == 0x2B) {
+            modrm_t m;
+            decode_modrm(code + 2, &m);
+            uint16_t rm_val = 0;
+            uint32_t addr = 0;
+            if (m.mod == 3) rm_val = (uint16_t)(gprs[m.rm] & 0xFFFF);
+            else { addr = modrm_effective_addr(&m, gprs); x86_mem_read16(ctx, addr, &rm_val); }
+            uint16_t reg_val = (uint16_t)(gprs[m.reg] & 0xFFFF);
+            bool dir_reg_dst = (op2 & 0x02) != 0;
+            uint32_t res = exec_group1(ctx, (op2 >> 3) & 7,
+                                       dir_reg_dst ? reg_val : rm_val,
+                                       dir_reg_dst ? rm_val : reg_val, true);
+            if (dir_reg_dst) {
+                gprs[m.reg] = (gprs[m.reg] & ~0xFFFFU) | (res & 0xFFFFU);
+            } else if (m.mod == 3) {
+                gprs[m.rm] = (gprs[m.rm] & ~0xFFFFU) | (res & 0xFFFFU);
+            } else {
+                x86_mem_write16(ctx, addr, (uint16_t)res);
+            }
+            ctx->regs.eip += 2 + m.len;
+            return true;
+        }
+
+        /* TEST AX, imm16 (0x66 0xA9) */
+        if (op2 == 0xA9) {
+            uint16_t imm = (uint16_t)code[2] | ((uint16_t)code[3] << 8);
+            uint16_t res = (uint16_t)(ctx->regs.eax & 0xFFFF) & imm;
+            ctx->regs.eflags &= ~(X86_EFLAGS_ZF | X86_EFLAGS_SF | X86_EFLAGS_CF | X86_EFLAGS_OF);
+            if (res == 0) ctx->regs.eflags |= X86_EFLAGS_ZF;
+            if (res & 0x8000) ctx->regs.eflags |= X86_EFLAGS_SF;
+            ctx->regs.eip += 4;
+            return true;
+        }
+
+        /* Group 3 r/m16 (0x66 0xF7) - TEST / NOT / NEG / MUL / IMUL / DIV / IDIV */
+        if (op2 == 0xF7) {
+            modrm_t m;
+            decode_modrm(code + 2, &m);
+            uint16_t val = 0;
+            uint32_t addr = 0;
+            if (m.mod == 3) val = (uint16_t)(gprs[m.rm] & 0xFFFF);
+            else { addr = modrm_effective_addr(&m, gprs); x86_mem_read16(ctx, addr, &val); }
+            switch (m.reg) {
+                case 0: { /* TEST r/m16, imm16 */
+                    uint16_t imm = (uint16_t)code[2 + m.len] | ((uint16_t)code[3 + m.len] << 8);
+                    uint16_t res = val & imm;
+                    ctx->regs.eflags &= ~(X86_EFLAGS_ZF | X86_EFLAGS_SF | X86_EFLAGS_CF | X86_EFLAGS_OF);
+                    if (res == 0) ctx->regs.eflags |= X86_EFLAGS_ZF;
+                    if (res & 0x8000) ctx->regs.eflags |= X86_EFLAGS_SF;
+                    ctx->regs.eip += 2 + m.len + 2;
+                    return true;
+                }
+                case 2: /* NOT r/m16 */
+                    val = ~val;
+                    if (m.mod == 3) gprs[m.rm] = (gprs[m.rm] & ~0xFFFFU) | val;
+                    else x86_mem_write16(ctx, addr, val);
+                    ctx->regs.eip += 2 + m.len;
+                    return true;
+                case 3: { /* NEG r/m16 */
+                    uint16_t res = (uint16_t)(0 - val);
+                    ctx->regs.eflags &= ~(X86_EFLAGS_ZF | X86_EFLAGS_SF | X86_EFLAGS_CF | X86_EFLAGS_OF);
+                    if (res == 0) ctx->regs.eflags |= X86_EFLAGS_ZF;
+                    if (res & 0x8000) ctx->regs.eflags |= X86_EFLAGS_SF;
+                    if (val != 0) ctx->regs.eflags |= X86_EFLAGS_CF;
+                    if (val == 0x8000) ctx->regs.eflags |= X86_EFLAGS_OF;
+                    if (m.mod == 3) gprs[m.rm] = (gprs[m.rm] & ~0xFFFFU) | res;
+                    else x86_mem_write16(ctx, addr, res);
+                    ctx->regs.eip += 2 + m.len;
+                    return true;
+                }
+                case 4: { /* MUL r/m16: DX:AX = AX * r/m16 */
+                    uint32_t prod = (uint32_t)(ctx->regs.eax & 0xFFFF) * (uint32_t)val;
+                    ctx->regs.eax = (ctx->regs.eax & ~0xFFFFU) | (prod & 0xFFFFU);
+                    ctx->regs.edx = (ctx->regs.edx & ~0xFFFFU) | ((prod >> 16) & 0xFFFFU);
+                    ctx->regs.eip += 2 + m.len;
+                    return true;
+                }
+                case 5: { /* IMUL r/m16 */
+                    int32_t prod = (int32_t)(int16_t)(ctx->regs.eax & 0xFFFF) * (int32_t)(int16_t)val;
+                    ctx->regs.eax = (ctx->regs.eax & ~0xFFFFU) | ((uint32_t)prod & 0xFFFFU);
+                    ctx->regs.edx = (ctx->regs.edx & ~0xFFFFU) | (((uint32_t)prod >> 16) & 0xFFFFU);
+                    ctx->regs.eip += 2 + m.len;
+                    return true;
+                }
+                case 6: { /* DIV r/m16 */
+                    if (val != 0) {
+                        uint32_t divd = ((ctx->regs.edx & 0xFFFF) << 16) | (ctx->regs.eax & 0xFFFF);
+                        ctx->regs.eax = (ctx->regs.eax & ~0xFFFFU) | ((divd / val) & 0xFFFFU);
+                        ctx->regs.edx = (ctx->regs.edx & ~0xFFFFU) | ((divd % val) & 0xFFFFU);
+                    }
+                    ctx->regs.eip += 2 + m.len;
+                    return true;
+                }
+                case 7: { /* IDIV r/m16 */
+                    int16_t d = (int16_t)val;
+                    if (d != 0) {
+                        int32_t divd = (int32_t)(((ctx->regs.edx & 0xFFFF) << 16) | (ctx->regs.eax & 0xFFFF));
+                        ctx->regs.eax = (ctx->regs.eax & ~0xFFFFU) | ((uint16_t)(divd / d) & 0xFFFFU);
+                        ctx->regs.edx = (ctx->regs.edx & ~0xFFFFU) | ((uint16_t)(divd % d) & 0xFFFFU);
+                    }
+                    ctx->regs.eip += 2 + m.len;
+                    return true;
+                }
+            }
+        }
+
+        /* Group 5 r/m16 (0x66 0xFF): INC (/0), DEC (/1), PUSH (/6) */
+        if (op2 == 0xFF) {
+            modrm_t m;
+            decode_modrm(code + 2, &m);
+            uint16_t val = 0;
+            uint32_t addr = 0;
+            if (m.mod == 3) val = (uint16_t)(gprs[m.rm] & 0xFFFF);
+            else { addr = modrm_effective_addr(&m, gprs); x86_mem_read16(ctx, addr, &val); }
+            if (m.reg == 0 || m.reg == 1) {
+                val = (m.reg == 0) ? (uint16_t)(val + 1) : (uint16_t)(val - 1);
+                if (m.mod == 3) gprs[m.rm] = (gprs[m.rm] & ~0xFFFFU) | val;
+                else x86_mem_write16(ctx, addr, val);
+                ctx->regs.eflags &= ~(X86_EFLAGS_ZF | X86_EFLAGS_SF);
+                if (val == 0) ctx->regs.eflags |= X86_EFLAGS_ZF;
+                if (val & 0x8000) ctx->regs.eflags |= X86_EFLAGS_SF;
+                ctx->regs.eip += 2 + m.len;
+                return true;
+            }
+            if (m.reg == 6) {
+                ctx->regs.esp -= 2;
+                x86_mem_write16(ctx, ctx->regs.esp, val);
+                ctx->regs.eip += 2 + m.len;
+                return true;
+            }
+        }
+
         fprintf(stderr, "[0x66 Prefix] Unhandled sub-opcode 0x%02X at EIP=0x%08X (bytes: %02X %02X %02X %02X %02X)\n",
                 op2, (unsigned int)ctx->regs.eip, code[0], code[1], code[2], code[3], code[4]);
     }
@@ -3864,7 +4091,36 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
         }
     }
 
-    /* ====== x87 FPU Opcodes (0xD9, 0xDD) ====== */
+    /* ====== x87 FPU Opcodes (0x9B, 0xD8..0xDF) ====== */
+    if (op == 0x9B) { /* FWAIT / WAIT */
+        ctx->regs.eip += 1;
+        return true;
+    }
+
+    if (op == 0xDF) {
+        uint8_t op2 = code[1];
+        if (op2 == 0xE0) { /* fnstsw ax */
+            ctx->regs.eax &= 0xFFFF0000U;
+            ctx->regs.eip += 2;
+            return true;
+        }
+        modrm_t m;
+        decode_modrm(code + 1, &m);
+        if (m.mod == 3) {
+            ctx->regs.eip += 2;
+            return true;
+        }
+        ctx->regs.eip += 1 + m.len;
+        return true;
+    }
+
+    if (op == 0xD8 || op == 0xDA || op == 0xDC || op == 0xDE) {
+        modrm_t m;
+        decode_modrm(code + 1, &m);
+        ctx->regs.eip += 1 + m.len;
+        return true;
+    }
+
     if (op == 0xD9) {
         uint8_t op2 = code[1];
         if (op2 == 0xE8) { /* fld1 */
@@ -3886,71 +4142,65 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
         }
         modrm_t m;
         decode_modrm(code + 1, &m);
-        if (m.reg == 0) { /* flds m32 */
+        if (m.mod != 3) {
             uint32_t addr = modrm_effective_addr(&m, gprs);
-            uint32_t raw = 0;
-            x86_mem_read32(ctx, addr, &raw);
-            float f;
-            memcpy(&f, &raw, sizeof(f));
-            ctx->fpu_top = (ctx->fpu_top - 1) & 7;
-            ctx->fpu_stack[ctx->fpu_top] = (double)f;
-            ctx->regs.eip += 1 + m.len;
-            return true;
+            if (m.reg == 0) { /* flds m32 */
+                uint32_t raw = 0;
+                x86_mem_read32(ctx, addr, &raw);
+                float f;
+                memcpy(&f, &raw, sizeof(f));
+                ctx->fpu_top = (ctx->fpu_top - 1) & 7;
+                ctx->fpu_stack[ctx->fpu_top] = (double)f;
+            } else if (m.reg == 2) { /* fsts m32 */
+                float f = (float)ctx->fpu_stack[ctx->fpu_top];
+                uint32_t raw;
+                memcpy(&raw, &f, sizeof(raw));
+                x86_mem_write32(ctx, addr, raw);
+            } else if (m.reg == 3) { /* fstps m32 */
+                float f = (float)ctx->fpu_stack[ctx->fpu_top];
+                ctx->fpu_top = (ctx->fpu_top + 1) & 7;
+                uint32_t raw;
+                memcpy(&raw, &f, sizeof(raw));
+                x86_mem_write32(ctx, addr, raw);
+            } else if (m.reg == 5) { /* fldcw m16 */
+                /* no-op */
+            } else if (m.reg == 7) { /* fnstcw m16 */
+                x86_mem_write16(ctx, addr, 0x027F);
+            }
         }
-        if (m.reg == 2) { /* fsts m32 */
-            uint32_t addr = modrm_effective_addr(&m, gprs);
-            float f = (float)ctx->fpu_stack[ctx->fpu_top];
-            uint32_t raw;
-            memcpy(&raw, &f, sizeof(raw));
-            x86_mem_write32(ctx, addr, raw);
-            ctx->regs.eip += 1 + m.len;
-            return true;
-        }
-        if (m.reg == 3) { /* fstps m32 */
-            uint32_t addr = modrm_effective_addr(&m, gprs);
-            float f = (float)ctx->fpu_stack[ctx->fpu_top];
-            ctx->fpu_top = (ctx->fpu_top + 1) & 7;
-            uint32_t raw;
-            memcpy(&raw, &f, sizeof(raw));
-            x86_mem_write32(ctx, addr, raw);
-            ctx->regs.eip += 1 + m.len;
-            return true;
-        }
+        ctx->regs.eip += 1 + m.len;
+        return true;
     }
 
     if (op == 0xDD) {
         modrm_t m;
         decode_modrm(code + 1, &m);
-        if (m.reg == 0) { /* fldl m64 */
+        if (m.mod != 3) {
             uint32_t addr = modrm_effective_addr(&m, gprs);
-            uint64_t raw = 0;
-            x86_mem_read64(ctx, addr, &raw);
-            double d;
-            memcpy(&d, &raw, sizeof(d));
-            ctx->fpu_top = (ctx->fpu_top - 1) & 7;
-            ctx->fpu_stack[ctx->fpu_top] = d;
-            ctx->regs.eip += 1 + m.len;
-            return true;
+            if (m.reg == 0) { /* fldl m64 */
+                uint64_t raw = 0;
+                x86_mem_read64(ctx, addr, &raw);
+                double d;
+                memcpy(&d, &raw, sizeof(d));
+                ctx->fpu_top = (ctx->fpu_top - 1) & 7;
+                ctx->fpu_stack[ctx->fpu_top] = d;
+            } else if (m.reg == 2) { /* fstl m64 */
+                double d = ctx->fpu_stack[ctx->fpu_top];
+                uint64_t raw;
+                memcpy(&raw, &d, sizeof(raw));
+                x86_mem_write64(ctx, addr, raw);
+            } else if (m.reg == 3) { /* fstpl m64 */
+                double d = ctx->fpu_stack[ctx->fpu_top];
+                ctx->fpu_top = (ctx->fpu_top + 1) & 7;
+                uint64_t raw;
+                memcpy(&raw, &d, sizeof(raw));
+                x86_mem_write64(ctx, addr, raw);
+            } else if (m.reg == 7) { /* fnstsw m16 */
+                x86_mem_write16(ctx, addr, 0x0000);
+            }
         }
-        if (m.reg == 2) { /* fstl m64 */
-            uint32_t addr = modrm_effective_addr(&m, gprs);
-            double d = ctx->fpu_stack[ctx->fpu_top];
-            uint64_t raw;
-            memcpy(&raw, &d, sizeof(raw));
-            x86_mem_write64(ctx, addr, raw);
-            ctx->regs.eip += 1 + m.len;
-            return true;
-        }
-        if (m.reg == 3) { /* fstpl m64 */
-            uint32_t addr = modrm_effective_addr(&m, gprs);
-            double d = ctx->fpu_stack[ctx->fpu_top];
-            ctx->fpu_top = (ctx->fpu_top + 1) & 7;
-            uint64_t raw;
-            memcpy(&raw, &d, sizeof(raw));
-            x86_mem_write64(ctx, addr, raw);
-            ctx->regs.eip += 1 + m.len;
-            return true;
-        }
+        ctx->regs.eip += 1 + m.len;
+        return true;
     }
 
     if (op == 0xDB) {
@@ -3961,6 +4211,10 @@ bool x86_interpret_instruction(x86_context_t *ctx) {
             ctx->regs.eip += 2;
             return true;
         }
+        modrm_t m;
+        decode_modrm(code + 1, &m);
+        ctx->regs.eip += 1 + m.len;
+        return true;
     }
 
     /* Group 3 r/m32 (0xF7) - TEST / NOT / NEG / MUL / IMUL / DIV / IDIV */

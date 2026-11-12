@@ -80,7 +80,8 @@ static uint32_t crt_getmainargs(win32_process_t *proc, uint32_t *args) {
     guest_mem_commit(&proc->mem, dummy_argv_va, 4096);
 
     uint32_t app_name_va = dummy_argv_va + 64;
-    guest_mem_write(&proc->mem, app_name_va, "winmine.exe", 12);
+    const char *exe_name = (proc && proc->exe_path[0]) ? proc->exe_path : "app.exe";
+    guest_mem_write(&proc->mem, app_name_va, exe_name, strlen(exe_name) + 1);
 
     uint32_t argv_ptrs[2] = { app_name_va, 0 };
     guest_mem_write(&proc->mem, dummy_argv_va, argv_ptrs, sizeof(argv_ptrs));
@@ -160,9 +161,22 @@ static uint32_t crt_realloc(win32_process_t *proc, uint32_t *args) {
     uint32_t heap_args[3] = { 0, 0, bytes };
     uint32_t new_va = k32_HeapAlloc(proc, heap_args);
     if (new_va && old_va) {
-        uint8_t *old_p = guest_va_to_host(&proc->mem, old_va);
-        uint8_t *new_p = guest_va_to_host(&proc->mem, new_va);
-        if (old_p && new_p) memcpy(new_p, old_p, bytes);
+        uint32_t old_sz = 4096;
+        if (old_va >= 8) {
+            uint32_t magic = 0, hsz = 0;
+            guest_mem_read(&proc->mem, old_va - 8, &magic, 4);
+            guest_mem_read(&proc->mem, old_va - 4, &hsz, 4);
+            if (magic == 0x48454150) old_sz = hsz;
+        }
+        uint32_t copy_sz = (old_sz < bytes) ? old_sz : bytes;
+        uint32_t done = 0;
+        while (done < copy_sz) {
+            uint32_t chunk = (copy_sz - done > 4096) ? 4096 : (copy_sz - done);
+            uint8_t tmp[4096];
+            guest_mem_read(&proc->mem, old_va + done, tmp, chunk);
+            guest_mem_write(&proc->mem, new_va + done, tmp, chunk);
+            done += chunk;
+        }
     }
     return new_va;
 }
@@ -204,18 +218,35 @@ static uint32_t crt_strchr(win32_process_t *proc, uint32_t *args) {
     return p ? (args[0] + (uint32_t)(p - s)) : 0;
 }
 static uint32_t crt_memset(win32_process_t *proc, uint32_t *args) {
-    void *dst = guest_va_to_host(&proc->mem, args[0]);
-    int val = (int)args[1];
-    size_t count = (size_t)args[2];
-    if (dst) memset(dst, val, count);
-    return args[0];
+    uint32_t dst_va = args[0];
+    uint8_t val = (uint8_t)args[1];
+    uint32_t count = args[2];
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t cur_va = dst_va + done;
+        uint32_t chunk = 4096U - (cur_va & 0xFFFU);
+        if (chunk > count - done) chunk = count - done;
+        uint8_t *p = guest_alloc_page(&proc->mem, cur_va);
+        if (p) memset(p, val, chunk);
+        done += chunk;
+    }
+    return dst_va;
 }
 static uint32_t crt_memcpy(win32_process_t *proc, uint32_t *args) {
-    void *dst = guest_va_to_host(&proc->mem, args[0]);
-    const void *src = guest_va_to_host(&proc->mem, args[1]);
-    size_t count = (size_t)args[2];
-    if (dst && src) memcpy(dst, src, count);
-    return args[0];
+    uint32_t dst_va = args[0];
+    uint32_t src_va = args[1];
+    uint32_t count = args[2];
+    uint32_t done = 0;
+    while (done < count) {
+        uint32_t cur_src = src_va + done;
+        uint32_t chunk = 4096U - (cur_src & 0xFFFU);
+        if (chunk > count - done) chunk = count - done;
+        uint8_t tmp[4096];
+        guest_mem_read(&proc->mem, cur_src, tmp, chunk);
+        guest_mem_write(&proc->mem, dst_va + done, tmp, chunk);
+        done += chunk;
+    }
+    return dst_va;
 }
 static uint32_t crt_atoi(win32_process_t *proc, uint32_t *args) {
     const char *s = (const char *)guest_va_to_host(&proc->mem, args[0]);
@@ -255,9 +286,9 @@ static uint32_t crt_isxdigit(win32_process_t *proc, uint32_t *args) {
     (void)proc;
     return (uint32_t)(isxdigit((int)args[0]) != 0);
 }
+static uint32_t s_err_va = 0;
 static uint32_t crt_strerror(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
-    static uint32_t s_err_va = 0;
     if (!s_err_va) {
         s_err_va = 0x003F6000;
         guest_mem_commit(&proc->mem, s_err_va, 4096);
@@ -363,18 +394,18 @@ static uint32_t crt_ismbblead(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
     return 0;
 }
+static uint32_t s_loc_va = 0;
 static uint32_t crt_localeconv(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
-    static uint32_t s_loc_va = 0;
     if (!s_loc_va) {
         s_loc_va = 0x003FA000;
         guest_mem_commit(&proc->mem, s_loc_va, 4096);
     }
     return s_loc_va;
 }
+static uint32_t s_c_str = 0;
 static uint32_t crt_setlocale(win32_process_t *proc, uint32_t *args) {
     (void)proc; (void)args;
-    static uint32_t s_c_str = 0;
     if (!s_c_str) {
         s_c_str = 0x003FB000;
         guest_mem_commit(&proc->mem, s_c_str, 4096);
@@ -391,18 +422,106 @@ static uint32_t crt_onexit(win32_process_t *proc, uint32_t *args) {
     return args[0];
 }
 static uint32_t crt_stdio_common_vswprintf(win32_process_t *proc, uint32_t *args) {
+    /* Signature: int _o___stdio_common_vswprintf(
+     *   uint64_t options [args[0], args[1]],
+     *   wchar_t *buffer [args[2]],
+     *   size_t buffer_count [args[3]],
+     *   const wchar_t *format [args[4]],
+     *   _locale_t locale [args[5]],
+     *   va_list arglist [args[6]]
+     * ) */
     uint32_t str_va = args[2];
     uint32_t max_len = args[3];
-    (void)args[4]; /* format_va */
+    uint32_t fmt_va = args[4];
+    uint32_t va_ptr = args[6];
 
-    if (str_va && max_len > 0) {
-        uint16_t sample[] = { '{','0','0','0','0','0','0','0','0','-','0','0','0','0','-','0','0','0','0','-','0','0','0','0','-','0','0','0','0','0','0','0','0','0','0','0','0','}', 0 };
-        size_t copy_len = sizeof(sample) / 2;
-        if (copy_len > max_len) copy_len = max_len;
-        guest_mem_write(&proc->mem, str_va, sample, copy_len * 2);
-        return (uint32_t)(copy_len - 1);
+    if (!str_va || max_len == 0) return (uint32_t)-1;
+    if (!fmt_va) {
+        uint16_t zero = 0;
+        guest_mem_write(&proc->mem, str_va, &zero, 2);
+        return 0;
     }
-    return 0;
+
+    uint16_t fmt_w[256] = {0};
+    guest_mem_read(&proc->mem, fmt_va, fmt_w, sizeof(fmt_w) - 2);
+
+    uint16_t out_w[512] = {0};
+    uint32_t out_len = 0;
+    uint32_t arg_off = 0;
+    int fi = 0;
+
+    while (fmt_w[fi] != 0 && out_len < 510 && out_len + 1 < max_len) {
+        if (fmt_w[fi] != '%') {
+            out_w[out_len++] = fmt_w[fi++];
+            continue;
+        }
+        fi++; /* skip '%' */
+        if (fmt_w[fi] == '%') {
+            out_w[out_len++] = '%';
+            fi++;
+            continue;
+        }
+        /* Skip flags, width, precision, length modifiers */
+        bool is_narrow_str = false;
+        while (fmt_w[fi] == '-' || fmt_w[fi] == '+' || fmt_w[fi] == '0' || fmt_w[fi] == ' ' || fmt_w[fi] == '#') fi++;
+        while (fmt_w[fi] >= '0' && fmt_w[fi] <= '9') fi++;
+        if (fmt_w[fi] == '.') {
+            fi++;
+            while (fmt_w[fi] >= '0' && fmt_w[fi] <= '9') fi++;
+        }
+        if (fmt_w[fi] == 'h') {
+            is_narrow_str = true;
+            fi++;
+        } else if (fmt_w[fi] == 'l' || fmt_w[fi] == 'w' || fmt_w[fi] == 'I') {
+            fi++;
+            if (fmt_w[fi] == 'l' || fmt_w[fi] == '3' || fmt_w[fi] == '6') fi++;
+            if (fmt_w[fi] == '2' || fmt_w[fi] == '4') fi++;
+        }
+
+        uint16_t spec = fmt_w[fi];
+        if (spec != 0) fi++;
+
+        uint32_t val = 0;
+        if (va_ptr != 0) {
+            guest_mem_read(&proc->mem, va_ptr + arg_off, &val, 4);
+            arg_off += 4;
+        }
+
+        char num_buf[64] = {0};
+        if (spec == 'd' || spec == 'i') {
+            snprintf(num_buf, sizeof(num_buf), "%d", (int32_t)val);
+            for (int k = 0; num_buf[k] && out_len < 510 && out_len + 1 < max_len; k++)
+                out_w[out_len++] = (uint16_t)(uint8_t)num_buf[k];
+        } else if (spec == 'u') {
+            snprintf(num_buf, sizeof(num_buf), "%u", val);
+            for (int k = 0; num_buf[k] && out_len < 510 && out_len + 1 < max_len; k++)
+                out_w[out_len++] = (uint16_t)(uint8_t)num_buf[k];
+        } else if (spec == 'x' || spec == 'X' || spec == 'p') {
+            snprintf(num_buf, sizeof(num_buf), (spec == 'x') ? "%x" : "%X", val);
+            for (int k = 0; num_buf[k] && out_len < 510 && out_len + 1 < max_len; k++)
+                out_w[out_len++] = (uint16_t)(uint8_t)num_buf[k];
+        } else if (spec == 'c' || spec == 'C') {
+            out_w[out_len++] = (uint16_t)(val & 0xFFFF);
+        } else if (spec == 's' || spec == 'S') {
+            bool narrow = (spec == 'S') || is_narrow_str;
+            if (val != 0) {
+                if (narrow) {
+                    char sbuf[256] = {0};
+                    guest_mem_read(&proc->mem, val, sbuf, sizeof(sbuf) - 1);
+                    for (int k = 0; sbuf[k] && out_len < 510 && out_len + 1 < max_len; k++)
+                        out_w[out_len++] = (uint16_t)(uint8_t)sbuf[k];
+                } else {
+                    uint16_t swbuf[256] = {0};
+                    guest_mem_read(&proc->mem, val, swbuf, sizeof(swbuf) - 2);
+                    for (int k = 0; swbuf[k] && out_len < 510 && out_len + 1 < max_len; k++)
+                        out_w[out_len++] = swbuf[k];
+                }
+            }
+        }
+    }
+    out_w[out_len] = 0;
+    guest_mem_write(&proc->mem, str_va, out_w, (out_len + 1) * 2);
+    return (int)out_len;
 }
 
 static uint32_t crt_amsg_exit(win32_process_t *proc, uint32_t *args) {
@@ -421,9 +540,12 @@ void msvcrt_init(void) {
     s_fmode_va = 0;
     s_commode_va = 0;
     s_acmdln_va = 0;
+    s_err_va = 0;
     s_initenv_va = 0;
     s_errno_va = 0;
     s_iob_va = 0;
+    s_loc_va = 0;
+    s_c_str = 0;
 
     /* Note: msvcrt functions are __cdecl (callee does NOT unwind stack) */
     win32_register_api("msvcrt.dll", "__set_app_type", 0, crt_set_app_type, 1);
