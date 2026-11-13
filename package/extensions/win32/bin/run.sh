@@ -3,7 +3,10 @@
 #  Win32 HLE Launcher for Amazon Kindle Paperwhite 5 (PW5 / Bellatrix)
 # ==============================================================================
 
-EXTENSION=/mnt/us/extensions/win32
+EXTENSION=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+[ -z "$EXTENSION" ] && EXTENSION=/mnt/us/extensions/win32
+# Early diagnostics (works on Colorsoft / other layouts); written next to the script
+{ echo "date: $(date)"; echo "ext: $EXTENSION"; uname -a; ls -l /dev/fb0 /dev/input 2>&1; cat /proc/cpuinfo 2>&1 | head -12; } > "$EXTENSION/diag.log" 2>&1
 TMP_DIR=/var/tmp/win32
 
 # 1. Prevent Screensaver and suspend native Kindle UI
