@@ -10,6 +10,14 @@ Boot genuine **Microsoft Windows 95** and run classic 16/32-bit Windows applicat
 
 ---
 
+## Demo
+
+<video src="https://raw.githubusercontent.com/yrlmz14/Windows-win32-HLE/main/kindle_win32_promo.mp4" controls width="360"></video>
+
+[Watch Promo Video (`kindle_win32_promo.mp4`)](https://github.com/yrlmz14/Windows-win32-HLE/blob/main/kindle_win32_promo.mp4)
+
+---
+
 ## Overview
 
 This repository contains two complementary execution engines tailored specifically for Kindle e-ink hardware:
