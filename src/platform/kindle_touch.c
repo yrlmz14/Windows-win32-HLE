@@ -245,10 +245,21 @@ void touch_poll(void) {
 
         LOGI("Touch DOWN at screen (%d, %d) [raw: %d, %d]", s_cur_x, s_cur_y, s_raw_x, s_raw_y);
 
-        /* 1. Emergency Exit Check (Top-Right Corner) */
+        /* 1. Emergency Exit Check (Triple-Tap Top-Right Corner) */
         if (s_cur_x >= DEFAULT_SCREEN_W - 80 && s_cur_y <= 80) {
-            LOGI("Emergency exit triggered at (%d, %d)", s_cur_x, s_cur_y);
-            exit(0);
+            static int s_exit_taps = 0;
+            static struct timespec s_last_exit_tap = {0, 0};
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - s_last_exit_tap.tv_sec) * 1000 +
+                              (now.tv_nsec - s_last_exit_tap.tv_nsec) / 1000000;
+            s_exit_taps = (elapsed_ms < 1500) ? (s_exit_taps + 1) : 1;
+            s_last_exit_tap = now;
+            if (s_exit_taps >= 3) {
+                LOGI("Emergency exit triggered (triple-tap) at (%d, %d)", s_cur_x, s_cur_y);
+                exit(0);
+            }
+            return;
         }
 
         /* 2. Virtual Keyboard */

@@ -9,8 +9,8 @@
 #include <string.h>
 
 /* Screen Dimensions (Kindle Paperwhite 5 Carta 1200 Display: 1236 x 1648 Portrait) */
-#define SCREEN_WIDTH_PORTRAIT   1236
-#define SCREEN_HEIGHT_PORTRAIT  1648
+#define SCREEN_WIDTH_PORTRAIT   618
+#define SCREEN_HEIGHT_PORTRAIT  824
 
 #ifdef _WIN32
 #define DEFAULT_SCREEN_W 800
